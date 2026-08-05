@@ -53,8 +53,8 @@ from typing import ClassVar
 from pyreljob import Job, JobManager, Task, TaskContext
 
 class SendEmail(Task):
-    def run(self, ctx: TaskContext) -> None:
-        send(ctx.args["to"], ctx.args.get("subject", "hi"))
+    async def run(self, ctx: TaskContext) -> None:
+        await send(ctx.args["to"], ctx.args.get("subject", "hi"))
 
 @dataclass
 class Notification(Job):        # define a job: a @dataclass + ordered tasks
@@ -77,12 +77,22 @@ point that runs in any process that has your code installed:
 from pyreljob.backends.sqlalchemy_backend import backend_from_url
 from pyreljob.core.worker import Worker
 
-Worker(backend_from_url("sqlite:///jobs.db")).run_forever()
+Worker(backend_from_url("sqlite:///jobs.db"), max_concurrency=10).run_forever()
 ```
 
 Workers poll the database, claim runs with a lease, execute the job's tasks,
-and renew the lease via a heartbeat. Run as many as you like against the same
-database.
+and renew the lease via a heartbeat. The worker is **asyncio-native**: tasks
+are `async def` coroutines, and `max_concurrency` controls how many runs
+execute in parallel per worker process (default 1). Run as many workers as you
+like against the same database — atomic claims prevent double-execution.
+
+## Concurrency
+
+Each worker runs up to `max_concurrency` runs at a time on its event loop.
+Scale two ways: raise `max_concurrency` for I/O-bound tasks (cheap, thousands
+of concurrent coroutines), or run more worker processes for CPU-bound work.
+Every task's `timeout` is enforced with `asyncio.wait_for`, so a timed-out task
+is cancelled cleanly instead of leaking a thread.
 
 ## How-to guide
 
@@ -92,8 +102,8 @@ database.
 from pyreljob import Task, TaskContext
 
 class SendEmail(Task):
-    def run(self, ctx: TaskContext) -> None:
-        send(ctx.args["to"], ctx.args.get("subject", "hi"))
+    async def run(self, ctx: TaskContext) -> None:
+        await send(ctx.args["to"], ctx.args.get("subject", "hi"))
 ```
 
 **2. Compose tasks into a job** — a `@dataclass` whose fields are the job's
@@ -129,7 +139,7 @@ manager.enqueue(Notification("x@y.z"))
 from pyreljob.backends.sqlalchemy_backend import backend_from_url
 from pyreljob.core.worker import Worker
 
-Worker(backend_from_url("sqlite:///jobs.db")).run_forever()
+Worker(backend_from_url("sqlite:///jobs.db"), max_concurrency=10).run_forever()
 ```
 
 **5. Schedule a recurring job** — fire it with the manager's beat loop:
@@ -185,14 +195,14 @@ list:
 
 ```python
 class Reserve(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         return reserve(ctx.args["slot"])          # result stored under "Reserve"
 
-    def undo(self, ctx: TaskContext) -> None:
+    async def undo(self, ctx: TaskContext) -> None:
         release(ctx.args["slot"])
 
 class Charge(Task):
-    def run(self, ctx: TaskContext) -> None:
+    async def run(self, ctx: TaskContext) -> None:
         charge(ctx.args["user"], ctx.result("Reserve"))
 
 @dataclass
@@ -289,10 +299,10 @@ Cancellation is cooperative — the worker flags the live `ctx`; call
 
 ```python
 class BigImport(Task):
-    def run(self, ctx: TaskContext) -> None:
-        for chunk in fetch():
+    async def run(self, ctx: TaskContext) -> None:
+        async for chunk in fetch():
             ctx.check_cancelled()   # raises JobCancelledError if cancelled
-            insert(chunk)
+            await insert(chunk)
 ```
 
 ```python
@@ -305,7 +315,7 @@ manager.cancel(job_id)   # stop only — never compensates
 class Slow(Task):
     timeout = 30          # seconds; exceeded -> failed, then retried
 
-    def run(self, ctx: TaskContext) -> None: ...
+    async def run(self, ctx: TaskContext) -> None: ...
 ```
 
 A hung task cannot be force-killed in-process; it is marked failed and the

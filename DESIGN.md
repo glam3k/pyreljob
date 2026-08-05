@@ -27,8 +27,8 @@ separate "chain" abstraction: the ordered task list lives on the Job itself.
 class Task(ABC):
     timeout: int | None = None      # optional watchdog, in seconds
 
-    def run(self, ctx: TaskContext) -> Any: ...
-    def undo(self, ctx: TaskContext) -> None: ...
+    async def run(self, ctx: TaskContext) -> Any: ...
+    async def undo(self, ctx: TaskContext) -> None: ...
 
 @dataclass
 class Job(ABC):
@@ -121,9 +121,9 @@ Manager beat ───────────────────►   run_
   so an optional unique `idempotency_key` on `enqueue` dedupes re-enqueues
   (re-enqueue returns the existing job). Tasks should be written idempotently.
 - **Timeouts**: a task whose `run()` exceeds `timeout` is marked failed and
-  goes through normal retry/compensation. The task runs in a watchdog thread;
-  a truly hung task cannot be force-killed in-process — the framework marks it
-  failed and moves on (worker process isolation would be a v2 concern).
+  goes through normal retry/compensation, via `asyncio.wait_for`. A coroutine
+  that never awaits can't be force-cancelled — the framework marks it failed
+  and moves on (worker process isolation would be a v2 concern).
 - **Cooperative cancellation**: `cancel(job_id)` marks the job cancelled,
   cancels its active run, and (for maintained jobs) stops future fires. The
   worker's heartbeat sets `ctx.cancelled` on the live run and the task aborts

@@ -1,25 +1,26 @@
-"""Worker — polls the database for runnable runs and executes them.
+"""Worker — asyncio-native executor that polls the database for runnable runs.
 
 A claimed unit of work is a :class:`RunRecord` — one invocation of a Job. The
 worker loads the run's job (for the job class, args, and the framework-level
 retry count), builds a shared :class:`TaskContext`, then runs the job's
-``tasks`` in order. Completed tasks are never re-run: task state is durable in
-the ``tasks`` table, so if the process dies the next claim resumes at the
-first non-succeeded task.
+``tasks`` in order as coroutines on the event loop. Up to ``max_concurrency``
+runs execute concurrently per worker process.
 
-Retries are per-task but configured per job: every task is retried up to the
-job's ``max_attempts`` with exponential backoff + jitter (tracked via the
-run's ``scheduled_at``). When a task exhausts its attempts, the worker
-compensates the completed tasks in reverse order and marks the run ``failed``.
-Cancellation is cooperative and is *stop only* — it never compensates.
+Completed tasks are never re-run: task state is durable in the ``tasks``
+table, so if the process dies the next claim resumes at the first
+non-succeeded task. Retries are per-task but configured per job: every task is
+retried up to the job's ``max_attempts`` with exponential backoff + jitter
+(tracked via the run's ``scheduled_at``). When a task exhausts its attempts,
+the worker compensates the completed tasks in reverse order and marks the run
+``failed``. Cancellation is cooperative and is *stop only* — it never
+compensates.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
-import threading
-import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -50,12 +51,14 @@ class Worker:
         retry_backoff: float = 2.0,
         lease_seconds: int = 30,
         worker_id: str | None = None,
+        max_concurrency: int = 1,
     ) -> None:
         self._backend = backend
         self._queue = queue
         self._poll_interval = poll_interval
         self._retry_backoff = retry_backoff
         self._lease_seconds = lease_seconds
+        self._max_concurrency = max_concurrency
         self._registry: dict[str, type[Job]] = registry or {}
         # A fresh, unique id per process, generated at startup — so every
         # crash/restart gets a new identity. Used to tag lease ownership
@@ -64,9 +67,8 @@ class Worker:
         # lease expiry, not the id, detects crashes.
         self._worker_id = worker_id or uuid.uuid4().hex[:12]
         self._running = False
-        self._current_run_id: int | None = None
-        self._current_job_id: int | None = None
-        self._current_ctx: TaskContext | None = None
+        # run_id -> (job_id, ctx) for all in-flight runs (heartbeat + cancel).
+        self._active: dict[int, tuple[int, TaskContext]] = {}
 
     def register(self, name: str, job_cls: type[Job]) -> None:
         """Register a job class under a dotted name."""
@@ -79,80 +81,113 @@ class Worker:
     def run_forever(self) -> None:
         """Poll for and execute runs until interrupted (SIGINT/SIGTERM).
 
-        On shutdown the current run is drained to completion before exiting.
+        Up to ``max_concurrency`` runs execute concurrently; on shutdown the
+        in-flight runs drain to completion before exiting.
         """
         install_shutdown_handler(self.stop)
         self._running = True
-        heartbeat = threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name="pyreljob-heartbeat"
+        logger.info(
+            "worker %s started (queue=%s, max_concurrency=%d)",
+            self._worker_id, self._queue or "*", self._max_concurrency,
         )
-        heartbeat.start()
-        logger.info("worker %s started (queue=%s)", self._worker_id, self._queue or "*")
         try:
-            while self._running:
-                try:
-                    self._tick()
-                except KeyboardInterrupt:
-                    break
-                except Exception:
-                    logger.exception("worker tick failed")
-                time.sleep(self._poll_interval)
+            asyncio.run(self._main())
+        except KeyboardInterrupt:
+            pass
         finally:
             self._running = False
-            heartbeat.join(timeout=2)
-            logger.info("worker %s stopped", self._worker_id)
 
     def stop(self) -> None:
         self._running = False
 
-    def _heartbeat_loop(self) -> None:
+    async def _main(self) -> None:
+        heartbeat = asyncio.create_task(self._heartbeat_loop())
+        pending: set[asyncio.Task[Any]] = set()
+        try:
+            while self._running:
+                # Claim runs up to the concurrency cap.
+                while self._running and len(pending) < self._max_concurrency:
+                    run = await asyncio.to_thread(
+                        self._backend.claim,
+                        self._worker_id,
+                        self._queue,
+                        lease_seconds=self._lease_seconds,
+                    )
+                    if run is None:
+                        break
+                    pending.add(asyncio.create_task(self._execute(run)))
+                if not pending:
+                    await asyncio.sleep(self._poll_interval)
+                else:
+                    await asyncio.wait(
+                        pending, timeout=self._poll_interval,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    pending = {t for t in pending if not t.done()}
+        finally:
+            self._running = False
+            heartbeat.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)  # drain
+        logger.info("worker %s stopped", self._worker_id)
+
+    async def _heartbeat_loop(self) -> None:
         interval = max(1.0, self._lease_seconds / 3)
         while self._running:
-            time.sleep(interval)
-            job_id = self._current_job_id
-            if job_id is None:
-                continue
-            if self._backend.is_job_cancelled(job_id):
-                ctx = self._current_ctx
-                if ctx is not None:
+            await asyncio.sleep(interval)
+            for run_id, (job_id, ctx) in list(self._active.items()):
+                if await asyncio.to_thread(self._backend.is_job_cancelled, job_id):
                     ctx.cancelled = True
-                continue
-            run_id = self._current_run_id
-            if run_id is not None and not self._backend.renew_lease(run_id, self._worker_id):
-                logger.warning(
-                    "run %s: lease lost (another worker claimed it)", run_id
-                )
-                self._current_run_id = None
-                self._current_job_id = None
-                self._current_ctx = None
+                    continue
+                if not await asyncio.to_thread(
+                    self._backend.renew_lease, run_id, self._worker_id
+                ):
+                    logger.warning(
+                        "run %s: lease lost (another worker claimed it)", run_id
+                    )
+                    self._active.pop(run_id, None)
 
-    def _tick(self) -> None:
-        run = self._backend.claim(
-            self._worker_id, self._queue, lease_seconds=self._lease_seconds
+    async def _tick(self) -> None:
+        """Claim and execute a single run (handy for tests/one-offs)."""
+        run = await asyncio.to_thread(
+            self._backend.claim,
+            self._worker_id,
+            self._queue,
+            lease_seconds=self._lease_seconds,
         )
         if run is None:
             return
-        self._execute(run)
+        await self._execute(run)
 
-    def _execute(self, run: RunRecord) -> None:
+    async def _execute(self, run: RunRecord) -> None:
         assert run.id is not None
-        job = self._backend.get(run.job_id)
+        try:
+            await self._run(run)
+        except Exception:
+            logger.exception("run %s: unhandled error", run.id)
+            await asyncio.to_thread(self._backend.fail_run, run.id, "unhandled error")
+
+    async def _run(self, run: RunRecord) -> None:
+        assert run.id is not None
+        job = await asyncio.to_thread(self._backend.get, run.job_id)
         if job is None:
             logger.error("run %s: job %s missing", run.id, run.job_id)
-            self._backend.fail_run(run.id, "job no longer exists")
+            await asyncio.to_thread(self._backend.fail_run, run.id, "job no longer exists")
             return
         if job.status == JobStatus.CANCELLED:
-            self._backend.cancel_run(run.id)
+            await asyncio.to_thread(self._backend.cancel_run, run.id)
             return
 
         cls = self._resolve(job.job)
         if cls is None:
             logger.error("run %s: no class registered for %r", run.id, job.job)
-            self._backend.fail_run(run.id, f"No class registered for {job.job!r}")
+            await asyncio.to_thread(
+                self._backend.fail_run, run.id, f"No class registered for {job.job!r}"
+            )
             return
 
         ctx = self._build_ctx(run, job)
-        records = self._backend.tasks(run.id)
+        records = await asyncio.to_thread(self._backend.tasks, run.id)
         records_by_pos = {record.position: record for record in records}
         start = next(
             (
@@ -164,9 +199,7 @@ class Worker:
             len(cls.tasks),
         )
 
-        self._current_run_id = run.id
-        self._current_job_id = run.job_id
-        self._current_ctx = ctx
+        self._active[run.id] = (run.job_id, ctx)
         try:
             # Resume after a prior worker that exhausted a task's retries but
             # crashed before finalizing the run as failed.
@@ -176,14 +209,16 @@ class Worker:
                     existing.status == TaskStatus.FAILED
                     and existing.attempts >= job.max_attempts
                 ):
-                    self._backend.set_run_ctx(run.id, ctx.as_dict())
-                    self._compensate(run.id, cls, ctx)
-                    self._backend.fail_run(run.id, existing.error or "task exhausted")
-                    self._reschedule(cls, job, run.id, ctx)
+                    await asyncio.to_thread(self._backend.set_run_ctx, run.id, ctx.as_dict())
+                    await self._compensate(run.id, cls, ctx)
+                    await asyncio.to_thread(
+                        self._backend.fail_run, run.id, existing.error or "task exhausted"
+                    )
+                    await self._reschedule(cls, job, run.id, ctx)
                     return
 
             for pos in range(start, len(cls.tasks)):
-                record = self._run_task(
+                record = await self._run_task(
                     run.id, cls, ctx, pos, records_by_pos.get(pos), job.max_attempts
                 )
                 if record == "cancel":
@@ -191,17 +226,15 @@ class Worker:
                 if record == "retry":
                     return
                 if record == "failed":
-                    self._reschedule(cls, job, run.id, ctx)
+                    await self._reschedule(cls, job, run.id, ctx)
                     return
-            self._backend.complete_run(run.id, ctx.results)
-            self._reschedule(cls, job, run.id, ctx)
+            await asyncio.to_thread(self._backend.complete_run, run.id, ctx.results)
+            await self._reschedule(cls, job, run.id, ctx)
             logger.info("run %s: done", run.id)
         finally:
-            self._current_run_id = None
-            self._current_job_id = None
-            self._current_ctx = None
+            self._active.pop(run.id, None)
 
-    def _reschedule(
+    async def _reschedule(
         self,
         job_cls: type[Job],
         job: JobRecord,
@@ -209,14 +242,14 @@ class Worker:
         ctx: TaskContext,
     ) -> None:
         """Ask the job when it should run next and re-arm the schedule."""
-        run = self._backend.get_run(run_id)
+        run = await asyncio.to_thread(self._backend.get_run, run_id)
         if run is None or job.id is None:
             return
         instance = job_cls.from_dict(job.args or {})
         next_runtime = instance.next_runtime(run, ctx)
-        self._backend.set_next_run_at(job.id, next_runtime)
+        await asyncio.to_thread(self._backend.set_next_run_at, job.id, next_runtime)
 
-    def _run_task(
+    async def _run_task(
         self,
         run_id: int,
         job_cls: type[Job],
@@ -228,13 +261,15 @@ class Worker:
         task_cls = job_cls.tasks[pos]
         attempts = (existing.attempts if existing else 0) + 1
 
-        self._backend.start_task(run_id, pos, task_cls.task_name(), attempts=attempts)
+        await asyncio.to_thread(
+            self._backend.start_task, run_id, pos, task_cls.task_name(), attempts=attempts
+        )
         try:
-            result = self._run_task_with_timeout(task_cls, ctx)
+            result = await self._run_task_with_timeout(task_cls, ctx)
         except JobCancelledError:
             logger.warning("run %s: cancelled during task %s", run_id, task_cls.__name__)
-            self._backend.cancel_task(run_id, pos)
-            self._backend.cancel_run(run_id)
+            await asyncio.to_thread(self._backend.cancel_task, run_id, pos)
+            await asyncio.to_thread(self._backend.cancel_run, run_id)
             return "cancel"
         except Exception as exc:  # noqa: BLE001 - any task failure is retried/failed
             error = f"{type(exc).__name__}: {exc}"
@@ -243,10 +278,12 @@ class Worker:
                     "run %s: task %s gave up after %d attempts: %s",
                     run_id, task_cls.__name__, attempts, error,
                 )
-                self._backend.set_run_ctx(run_id, ctx.as_dict())
-                self._backend.fail_task(run_id, pos, error, attempts=attempts)
-                self._compensate(run_id, job_cls, ctx)
-                self._backend.fail_run(run_id, error)
+                await asyncio.to_thread(self._backend.set_run_ctx, run_id, ctx.as_dict())
+                await asyncio.to_thread(
+                    self._backend.fail_task, run_id, pos, error, attempts=attempts
+                )
+                await self._compensate(run_id, job_cls, ctx)
+                await asyncio.to_thread(self._backend.fail_run, run_id, error)
                 return "failed"  # run finalized as failed; nothing more to run
             retry_at = datetime.now() + timedelta(seconds=self._backoff(attempts))
             logger.warning(
@@ -254,59 +291,47 @@ class Worker:
                 run_id, task_cls.__name__, attempts, max_attempts,
                 (retry_at - datetime.now()).total_seconds(),
             )
-            self._backend.set_run_ctx(run_id, ctx.as_dict())
-            self._backend.fail_task(
-                run_id, pos, error, attempts=attempts, retry_at=retry_at
+            await asyncio.to_thread(self._backend.set_run_ctx, run_id, ctx.as_dict())
+            await asyncio.to_thread(
+                self._backend.fail_task, run_id, pos, error, attempts=attempts,
+                retry_at=retry_at,
             )
-            self._backend.fail_run(run_id, error, retry_at=retry_at, attempts=attempts)
+            await asyncio.to_thread(
+                self._backend.fail_run, run_id, error, retry_at=retry_at, attempts=attempts
+            )
             return "retry"
 
         ctx.results[task_cls.__name__] = result
-        self._backend.succeed_task(run_id, pos, result)
-        self._backend.set_run_ctx(run_id, ctx.as_dict())
+        await asyncio.to_thread(self._backend.succeed_task, run_id, pos, result)
+        await asyncio.to_thread(self._backend.set_run_ctx, run_id, ctx.as_dict())
         logger.info("run %s: task %s ok", run_id, task_cls.__name__)
         return "ok"
 
-    def _compensate(
+    async def _compensate(
         self,
         run_id: int,
         job_cls: type[Job],
         ctx: TaskContext,
     ) -> None:
-        for record in reversed(self._backend.tasks(run_id)):
+        records = await asyncio.to_thread(self._backend.tasks, run_id)
+        for record in reversed(records):
             if record.status != TaskStatus.SUCCEEDED:
                 continue
             task_cls = task_for_record(record, job_cls)
             try:
-                task_cls().undo(ctx)
+                await task_cls().undo(ctx)
             except Exception:
                 logger.exception(
                     "run %s: task %s undo failed", run_id, task_cls.__name__
                 )
-            self._backend.compensate_task(run_id, record.position)
+            await asyncio.to_thread(self._backend.compensate_task, run_id, record.position)
 
-    def _run_task_with_timeout(self, task_cls: type[Task], ctx: TaskContext) -> object:
+    async def _run_task_with_timeout(self, task_cls: type[Task], ctx: TaskContext) -> object:
         task = task_cls()
         timeout = task.timeout
         if timeout is None:
-            return task.run(ctx)
-
-        box: dict[str, Any] = {}
-
-        def _target() -> None:
-            try:
-                box["result"] = task.run(ctx)
-            except BaseException as exc:  # noqa: BLE001 - captured, re-raised below
-                box["error"] = exc
-
-        thread = threading.Thread(target=_target, daemon=True)
-        thread.start()
-        thread.join(timeout)
-        if thread.is_alive():
-            raise TimeoutError(f"{task_cls.__name__} exceeded {timeout}s timeout")
-        if "error" in box:
-            raise box["error"]
-        return box.get("result")
+            return await task.run(ctx)
+        return await asyncio.wait_for(task.run(ctx), timeout=timeout)
 
     def _build_ctx(self, run: RunRecord, job: JobRecord) -> TaskContext:
         ctx = (

@@ -6,6 +6,7 @@ one step within a run.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 import time
@@ -33,6 +34,8 @@ from pyreljob.orm import JobModel, RunModel
 
 _release = threading.Event()
 UNDONE: list[str] = []
+_CONCURRENCY: dict[str, int] = {"active": 0, "max": 0}
+_lock = threading.Lock()
 
 
 def job_cls_path(cls: type) -> str:
@@ -48,8 +51,13 @@ def make_due(backend, run_id: int) -> None:
         )
 
 
+def tick(worker: Worker) -> None:
+    """Run a single claim+execute pass on the async worker from a sync test."""
+    asyncio.run(worker._tick())
+
+
 class Add(Task):
-    def run(self, ctx: TaskContext) -> int:
+    async def run(self, ctx: TaskContext) -> int:
         return ctx.args["a"] + ctx.args["b"]
 
 
@@ -62,7 +70,7 @@ class Sum(Job):
 
 
 class Flaky(Task):
-    def run(self, ctx: TaskContext) -> None:
+    async def run(self, ctx: TaskContext) -> None:
         if not ctx.state.get("tried"):
             ctx.state["tried"] = True
             raise ValueError("boom")
@@ -74,7 +82,7 @@ class FlakyJob(Job):
 
 
 class AlwaysFails(Task):
-    def run(self, ctx: TaskContext) -> None:
+    async def run(self, ctx: TaskContext) -> None:
         raise ValueError("always")
 
 
@@ -84,10 +92,8 @@ class FailingJob(Job):
 
 
 class SlowTask(Task):
-    timeout = 1
-
-    def run(self, ctx: TaskContext) -> str:
-        _release.wait(10)
+    async def run(self, ctx: TaskContext) -> str:
+        await asyncio.to_thread(_release.wait, 10)
         return "ok"
 
 
@@ -96,20 +102,32 @@ class SlowJob(Job):
     tasks: ClassVar = [SlowTask]
 
 
+class HangingTask(Task):
+    timeout = 1
+
+    async def run(self, ctx: TaskContext) -> str:
+        await asyncio.sleep(30)  # cooperative -> cancellable by wait_for
+
+
+@dataclass
+class HangingJob(Job):
+    tasks: ClassVar = [HangingTask]
+
+
 class TaskA(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         ctx.state.setdefault("order", []).append("1")
         return "one"
 
 
 class TaskB(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         ctx.state.setdefault("order", []).append("2")
         return ctx.result("TaskA") + "-two"
 
 
 class TaskC(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         ctx.state.setdefault("order", []).append("3")
         raise RuntimeError("nope")
 
@@ -120,18 +138,18 @@ class ThreeTask(Job):
 
 
 class Reserve(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         return "reserved"
 
-    def undo(self, ctx: TaskContext) -> None:
+    async def undo(self, ctx: TaskContext) -> None:
         UNDONE.append("reserve")
 
 
 class Charge(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         return "charged"
 
-    def undo(self, ctx: TaskContext) -> None:
+    async def undo(self, ctx: TaskContext) -> None:
         UNDONE.append("charge")
 
 
@@ -141,9 +159,9 @@ class Saga(Job):
 
 
 class BlockingTask(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         while not ctx.cancelled:
-            time.sleep(0.02)
+            await asyncio.sleep(0.02)
         raise JobCancelledError()
 
 
@@ -153,12 +171,12 @@ class BlockingJob(Job):
 
 
 class Resumable1(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         return "one"
 
 
 class Resumable2(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         if not ctx.state.get("tried"):
             ctx.state["tried"] = True
             raise ValueError("retry me")
@@ -171,7 +189,7 @@ class Resumable(Job):
 
 
 class Poll(Task):
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         return "ok"
 
 
@@ -186,16 +204,34 @@ class Poller(Job):
 class NamedTask(Task):
     name = "send-email"
 
-    def run(self, ctx: TaskContext) -> str:
+    async def run(self, ctx: TaskContext) -> str:
         return "ok"
 
-    def undo(self, ctx: TaskContext) -> None:
+    async def undo(self, ctx: TaskContext) -> None:
         UNDONE.append("send-email")
 
 
 @dataclass
 class NamedJob(Job):
     tasks: ClassVar = [NamedTask]
+
+
+class ConcurrentTask(Task):
+    async def run(self, ctx: TaskContext) -> str:
+        with _lock:
+            _CONCURRENCY["active"] += 1
+            _CONCURRENCY["max"] = max(_CONCURRENCY["max"], _CONCURRENCY["active"])
+        try:
+            await asyncio.sleep(0.5)
+        finally:
+            with _lock:
+                _CONCURRENCY["active"] -= 1
+        return "ok"
+
+
+@dataclass
+class ConcurrentJob(Job):
+    tasks: ClassVar = [ConcurrentTask]
 
 
 @pytest.fixture()
@@ -221,8 +257,29 @@ def test_worker_id_generated_per_process(manager):
 
     job = manager.enqueue(Sum(1, 1))
     w3.register(job_cls_path(Sum), Sum)
-    w3._tick()
+    tick(w3)
     assert manager.runs(job.id)[0].worker_id == "worker-1"  # lease tagged with the id
+
+
+def test_worker_max_concurrency(manager):
+    _CONCURRENCY["active"] = 0
+    _CONCURRENCY["max"] = 0
+    for _ in range(3):
+        manager.enqueue(ConcurrentJob())
+
+    worker = Worker(manager.backend, max_concurrency=2, poll_interval=0.05)
+    worker.register(job_cls_path(ConcurrentJob), ConcurrentJob)
+    thread = threading.Thread(target=worker.run_forever)
+    thread.start()
+    try:
+        deadline = time.time() + 20
+        while manager.counts().get("succeeded", 0) < 3 and time.time() < deadline:
+            time.sleep(0.05)
+        assert manager.counts()["succeeded"] == 3
+        assert _CONCURRENCY["max"] == 2  # two runs really executed in parallel
+    finally:
+        worker.stop()
+        thread.join(timeout=5)
 
 
 def test_custom_task_name(manager):
@@ -231,14 +288,14 @@ def test_custom_task_name(manager):
     job = manager.enqueue(NamedJob())
     worker = Worker(manager.backend)
     worker.register(job_cls_path(NamedJob), NamedJob)
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
     record = manager.tasks(run.id)[0]
     assert record.task_name == "send-email"  # custom name stored, not the dotted path
 
     UNDONE.clear()
-    manager.undo(job.id)  # still resolves the class by position
+    asyncio.run(manager.undo(job.id))  # still resolves the class by position
     assert UNDONE == ["send-email"]
 
 
@@ -313,7 +370,7 @@ def test_plain_job_class_with_custom_serialization(manager):
     assert job.args == {"a": 2, "b": 5}
     worker = Worker(manager.backend)
     worker.register(job_cls_path(CustomJob), CustomJob)
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
     assert run.result == {"Add": 7}
@@ -332,7 +389,7 @@ def test_worker_executes_run(manager):
     job = manager.enqueue(Sum(2, 3))
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Sum), Sum)
-    worker._tick()
+    tick(worker)
 
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
@@ -351,7 +408,7 @@ def test_timestamps_are_recorded(manager):
 
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Sum), Sum)
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.created_at is not None
     assert run.updated_at is not None
@@ -367,7 +424,7 @@ def test_worker_runs_tasks_in_order_with_shared_ctx(manager):
     job = manager.enqueue(ThreeTask(), max_attempts=1)
     worker = Worker(manager.backend)
     worker.register(job_cls_path(ThreeTask), ThreeTask)
-    worker._tick()
+    tick(worker)
 
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.FAILED
@@ -385,7 +442,7 @@ def test_worker_skips_delayed_run(manager):
     job = manager.enqueue(Sum(1, 1), scheduled_at=datetime.now() + timedelta(hours=1))
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Sum), Sum)
-    worker._tick()
+    tick(worker)
     assert manager.runs(job.id)[0].status == RunStatus.PENDING
 
 
@@ -394,13 +451,13 @@ def test_worker_retries_task_with_job_max_attempts(manager):
     worker = Worker(manager.backend)
     worker.register(job_cls_path(FlakyJob), FlakyJob)
 
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.PENDING
     assert run.scheduled_at is not None
 
     make_due(manager.backend, run.id)
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
     record = manager.tasks(run.id)[0]
@@ -417,7 +474,7 @@ def test_failing_chain_compensates_in_reverse(manager):
     bad_job = manager.enqueue(Bad(), max_attempts=1)
     worker = Worker(manager.backend, retry_backoff=2.0)
     worker.register(job_cls_path(Bad), Bad)
-    worker._tick()
+    tick(worker)
     bad_run = manager.runs(bad_job.id)[0]
     assert bad_run.status == RunStatus.FAILED
     assert "always" in bad_run.error
@@ -432,12 +489,12 @@ def test_failing_chain_compensates_in_reverse(manager):
     job = manager.enqueue(Saga())
     worker2 = Worker(manager.backend)
     worker2.register(job_cls_path(Saga), Saga)
-    worker2._tick()
+    tick(worker2)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
 
     UNDONE.clear()
-    manager.undo(job.id)
+    asyncio.run(manager.undo(job.id))
     assert UNDONE == ["charge", "reserve"]
     assert [s.status for s in manager.tasks(run.id)] == [
         TaskStatus.COMPENSATED,
@@ -446,12 +503,11 @@ def test_failing_chain_compensates_in_reverse(manager):
 
 
 def test_task_timeout_fails_task(manager):
-    _release.clear()
-    job = manager.enqueue(SlowJob())
+    job = manager.enqueue(HangingJob())
     worker = Worker(manager.backend)
-    worker.register(job_cls_path(SlowJob), SlowJob)
+    worker.register(job_cls_path(HangingJob), HangingJob)
     start = time.time()
-    worker._tick()
+    tick(worker)
     elapsed = time.time() - start
     assert elapsed < 3
     run = manager.runs(job.id)[0]
@@ -497,13 +553,13 @@ def test_worker_resumes_after_crash(manager):
     run = manager.runs(job.id)[0]
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Resumable), Resumable)
-    worker._tick()
+    tick(worker)
     records = manager.tasks(run.id)
     assert records[0].status == TaskStatus.SUCCEEDED
     assert records[1].status == TaskStatus.FAILED
 
     make_due(manager.backend, run.id)
-    worker._tick()  # resumes at Resumable2; succeeds; AlwaysFails fails once
+    tick(worker)  # resumes at Resumable2; succeeds; AlwaysFails fails once
     records = manager.tasks(run.id)
     assert records[0].status == TaskStatus.SUCCEEDED  # never re-run
     assert records[0].attempts == 1
@@ -512,7 +568,7 @@ def test_worker_resumes_after_crash(manager):
     assert manager.runs(job.id)[0].status == RunStatus.PENDING
 
     make_due(manager.backend, run.id)
-    worker._tick()  # AlwaysFails exhausts -> compensate -> failed
+    tick(worker)  # AlwaysFails exhausts -> compensate -> failed
     records = manager.tasks(run.id)
     assert records[0].status == TaskStatus.COMPENSATED
     assert records[1].status == TaskStatus.COMPENSATED
@@ -524,7 +580,7 @@ def test_worker_fails_when_class_cannot_resolve(manager, monkeypatch):
     job = manager.enqueue(Sum(1, 1))
     worker = Worker(manager.backend)
     monkeypatch.setattr("pyreljob.core.worker.resolve_job", lambda name: None)
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.FAILED
     assert "No class registered" in run.error
@@ -542,7 +598,7 @@ def test_worker_resolves_class_by_dotted_path(manager, monkeypatch):
 
     job = manager.enqueue(Sum(4, 5))
     worker = Worker(manager.backend)
-    worker._tick()
+    tick(worker)
     assert manager.runs(job.id)[0].result == {"Add": 9}
 
 
@@ -579,7 +635,7 @@ def test_self_scheduling_job(manager):
 
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Poller), Poller)
-    worker._tick()  # executes run 1 -> re-arms next_runtime from the run's finish time
+    tick(worker)  # executes run 1 -> re-arms next_runtime from the run's finish time
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
     scheduled = manager.get(job.id).next_run_at
@@ -642,7 +698,7 @@ def test_claim_reclaims_expired_lease(manager):
     worker = Worker(manager.backend)
     worker.register(job_cls_path(SlowJob), SlowJob)
 
-    thread = threading.Thread(target=worker._tick)
+    thread = threading.Thread(target=lambda: asyncio.run(worker._tick()))
     thread.start()
     time.sleep(0.2)
     assert manager.runs(job.id)[0].status == RunStatus.RUNNING
@@ -672,7 +728,7 @@ def test_renew_lease(manager):
     worker = Worker(manager.backend)
     worker.register(job_cls_path(SlowJob), SlowJob)
 
-    thread = threading.Thread(target=worker._tick)
+    thread = threading.Thread(target=lambda: asyncio.run(worker._tick()))
     thread.start()
     time.sleep(0.2)
 
@@ -691,7 +747,7 @@ def test_retry_backoff_uses_jitter(manager, monkeypatch):
     job = manager.enqueue(FlakyJob())
     worker = Worker(manager.backend, retry_backoff=2.0)
     worker.register(job_cls_path(FlakyJob), FlakyJob)
-    worker._tick()
+    tick(worker)
 
     after = manager.runs(job.id)[0]
     assert after.status == RunStatus.PENDING

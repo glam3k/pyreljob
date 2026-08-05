@@ -8,6 +8,7 @@ Skipped unless TEST_DATABASE_URL is set, e.g.::
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -27,8 +28,13 @@ pytestmark = pytest.mark.skipif(PG_URL is None, reason="TEST_DATABASE_URL not se
 _release = threading.Event()
 
 
+def tick(worker: Worker) -> None:
+    """Run a single claim+execute pass on the async worker from a sync test."""
+    asyncio.run(worker._tick())
+
+
 class Add(Task):
-    def run(self, ctx: TaskContext) -> int:
+    async def run(self, ctx: TaskContext) -> int:
         return ctx.args["a"] + ctx.args["b"]
 
 
@@ -41,8 +47,8 @@ class Sum(Job):
 
 
 class Slow(Task):
-    def run(self, ctx: TaskContext) -> str:
-        _release.wait(10)
+    async def run(self, ctx: TaskContext) -> str:
+        await asyncio.to_thread(_release.wait, 10)
         return "ok"
 
 
@@ -77,7 +83,7 @@ def test_enqueue_worker_roundtrip(manager):
     job = manager.enqueue(Sum(3, 4))
     worker = Worker(manager.backend)
     worker.register("pg.Sum", Sum)
-    worker._tick()
+    tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
     assert run.result == {"Add": 7}
@@ -113,7 +119,7 @@ def test_worker_reclaims_expired_lease(manager):
     run = manager.runs(job.id)[0]
     worker = Worker(manager.backend)
     worker.register("pg.SlowJob", SlowJob)
-    t = threading.Thread(target=worker._tick)
+    t = threading.Thread(target=lambda: asyncio.run(worker._tick()))
     t.start()
     time.sleep(0.5)
     assert manager.runs(job.id)[0].status == RunStatus.RUNNING

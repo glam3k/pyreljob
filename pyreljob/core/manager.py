@@ -132,11 +132,12 @@ class JobManager:
         """
         self._backend.cancel_job(job_id)
 
-    def undo(self, job_id: int) -> None:
+    async def undo(self, job_id: int) -> None:
         """Manually compensate a job's most recent run (saga pattern).
 
-        Reconstructs the job and calls ``undo(ctx)`` on succeeded tasks in
-        reverse order, marking each task ``compensated``.
+        Reconstructs the job and ``await``s ``undo(ctx)`` on succeeded tasks in
+        reverse order, marking each task ``compensated``. Async because task
+        ``undo`` methods are coroutines.
         """
         record = self._backend.get(job_id)
         if record is None:
@@ -157,7 +158,7 @@ class JobManager:
             if task_record.status != TaskStatus.SUCCEEDED:
                 continue
             task_cls = task_for_record(task_record, cls)
-            task_cls().undo(ctx)
+            await task_cls().undo(ctx)
             self._backend.compensate_task(run.id, task_record.position)
 
     def get(self, job_id: int) -> JobRecord | None:

@@ -14,14 +14,14 @@ Example::
     from pyreljob import JobManager, Job, Task, TaskContext
 
     class ReserveSlot(Task):
-        def run(self, ctx: TaskContext) -> str:
+        async def run(self, ctx: TaskContext) -> str:
             return reserve(ctx.args["slot"])
 
-        def undo(self, ctx: TaskContext) -> None:
+        async def undo(self, ctx: TaskContext) -> None:
             release(ctx.args["slot"])
 
     class Charge(Task):
-        def run(self, ctx: TaskContext) -> None:
+        async def run(self, ctx: TaskContext) -> None:
             charge(ctx.args["user"], ctx.result("ReserveSlot"))
 
     @dataclass
@@ -110,7 +110,11 @@ class TaskContext:
 
 
 class Task(ABC):
-    """An atomic unit of work. Instantiated per task; stateless by design."""
+    """An atomic unit of work. Instantiated per task; stateless by design.
+
+    ``run``/``undo`` are ``async def`` — the worker is asyncio-native, so each
+    task runs as a coroutine on the event loop.
+    """
 
     #: Optional human-friendly name; defaults to the dotted class path. Used
     #: for observability (stored in ``tasks.task_name``). Resolution back to
@@ -121,10 +125,10 @@ class Task(ABC):
     timeout: int | None = None
 
     @abstractmethod
-    def run(self, ctx: TaskContext) -> Any:
+    async def run(self, ctx: TaskContext) -> Any:
         """Perform the work. Receives everything it needs through ``ctx``."""
 
-    def undo(self, ctx: TaskContext) -> None:
+    async def undo(self, ctx: TaskContext) -> None:
         """Compensation, invoked in reverse order when a run fails
         (or manually via ``JobManager.undo``)."""
 

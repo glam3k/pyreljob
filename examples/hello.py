@@ -17,7 +17,7 @@ The task sleeps before and after printing so you can watch the run go
 ``pending -> running -> succeeded`` and see graceful shutdown drain it.
 """
 
-import time
+import asyncio
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -25,10 +25,10 @@ from pyreljob import Job, Task, TaskContext
 
 
 class SayHello(Task):
-    def run(self, ctx: TaskContext) -> str:
-        time.sleep(2)
+    async def run(self, ctx: TaskContext) -> str:
+        await asyncio.sleep(2)
         print(f"hello {ctx.args.get('name', 'world')}!")
-        time.sleep(2)
+        await asyncio.sleep(2)
         return "said hello"
 
 
