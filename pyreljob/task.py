@@ -120,6 +120,9 @@ class Task(ABC):
     #: for observability (stored in ``tasks.task_name``). Resolution back to
     #: the class is by position, so a custom name needs no registry.
     name: ClassVar[str | None] = None
+    #: Optional per-task retry budget; overrides the job's ``max_attempts``
+    #: for this task. ``None`` (default) uses the job's budget.
+    max_attempts: ClassVar[int | None] = None
     #: Optional watchdog timeout in seconds; the task is failed if exceeded.
     #: The retry budget is a framework-level ``max_attempts`` set per job.
     timeout: int | None = None

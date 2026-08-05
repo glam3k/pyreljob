@@ -223,10 +223,29 @@ def _add_timestamps(conn: Connection) -> None:
         conn.execute(text("ALTER TABLE tasks ADD COLUMN updated_at TIMESTAMP"))
 
 
+def _add_job_retries(conn: Connection) -> None:
+    """v6: whole-run retries on jobs.
+
+    ``retries`` is the number of times to re-run the whole job after a failed
+    run; ``attempts`` is the consecutive-failure counter (reset on success),
+    used to decide when retries are exhausted.
+    """
+    columns = {c["name"] for c in inspect(conn).get_columns("jobs")}
+    if "retries" not in columns:
+        conn.execute(
+            text("ALTER TABLE jobs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0")
+        )
+    if "attempts" not in columns:
+        conn.execute(
+            text("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        )
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "create jobs table", _create_jobs_table),
     Migration(2, "index job schedule", _create_schedule_index),
     Migration(3, "add job lease (locked_at)", _add_locked_at),
     Migration(4, "job entities, runs, tasks", _job_run_task_model),
     Migration(5, "add created_at/updated_at timestamps", _add_timestamps),
+    Migration(6, "add job-level retries", _add_job_retries),
 ]

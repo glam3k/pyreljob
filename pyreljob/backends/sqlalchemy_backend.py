@@ -55,6 +55,7 @@ class SQLAlchemyBackend(Backend):
         queue: str = "default",
         priority: int = 0,
         max_attempts: int = 3,
+        retries: int = 0,
         idempotency_key: str | None = None,
         scheduled_at: datetime | None = None,
     ) -> JobRecord:
@@ -70,6 +71,7 @@ class SQLAlchemyBackend(Backend):
             priority=priority,
             source=JobSource.ON_DEMAND,
             max_attempts=max_attempts,
+            retries=retries,
             idempotency_key=key,
             updated_at=datetime.now(),
         )
@@ -106,6 +108,7 @@ class SQLAlchemyBackend(Backend):
         *,
         queue: str = "default",
         max_attempts: int = 3,
+        retries: int = 0,
         next_run_at: datetime | None = None,
     ) -> JobRecord:
         with Session(self._engine) as session:
@@ -126,6 +129,7 @@ class SQLAlchemyBackend(Backend):
             source=JobSource.SCHEDULED,
             cron=cron,
             max_attempts=max_attempts,
+            retries=retries,
             next_run_at=next_run_at,
             updated_at=datetime.now(),
         )
@@ -164,6 +168,24 @@ class SQLAlchemyBackend(Backend):
         with Session(self._engine) as session:
             model = session.get(JobModel, job_id)
             return model is not None and model.status == JobStatus.CANCELLED
+
+    def increment_job_attempts(self, job_id: int) -> int:
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                update(JobModel)
+                .where(JobModel.id == job_id)
+                .values(attempts=JobModel.attempts + 1, updated_at=datetime.now())
+                .returning(JobModel.attempts)
+            ).first()
+            return row[0] if row else 0
+
+    def reset_job_attempts(self, job_id: int) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(JobModel)
+                .where(JobModel.id == job_id)
+                .values(attempts=0, updated_at=datetime.now())
+            )
 
     def delete_job(self, job_id: int) -> None:
         with Session(self._engine) as session:

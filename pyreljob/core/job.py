@@ -55,6 +55,8 @@ class JobRecord:
     cron: str | None = None
     next_run_at: datetime | None = None
     max_attempts: int = 3
+    retries: int = 0
+    attempts: int = 0
     idempotency_key: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -72,6 +74,8 @@ class JobRecord:
             cron=model.cron,
             next_run_at=model.next_run_at,
             max_attempts=model.max_attempts,
+            retries=model.retries,
+            attempts=model.attempts,
             idempotency_key=model.idempotency_key,
             created_at=model.created_at,
             updated_at=model.updated_at,

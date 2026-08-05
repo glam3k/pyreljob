@@ -34,6 +34,8 @@ class JobModel(Base):
         DateTime(timezone=True), nullable=True, index=True
     )
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     idempotency_key: Mapped[str | None] = mapped_column(
         String(255), nullable=True, unique=True
     )

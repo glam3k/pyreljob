@@ -23,13 +23,16 @@ class Backend(ABC):
         queue: str = "default",
         priority: int = 0,
         max_attempts: int = 3,
+        retries: int = 0,
         idempotency_key: str | None = None,
         scheduled_at: datetime | None = None,
     ) -> JobRecord:
         """Create a durable job and its first run.
 
-        With ``idempotency_key``, returns the existing job instead of creating
-        a duplicate. ``scheduled_at`` delays the first run.
+        ``max_attempts`` is the per-task retry budget; ``retries`` is the
+        whole-run retry count (how many times to re-run the job after a failed
+        run). With ``idempotency_key``, returns the existing job instead of
+        creating a duplicate. ``scheduled_at`` delays the first run.
         """
 
     @abstractmethod
@@ -41,6 +44,7 @@ class Backend(ABC):
         *,
         queue: str = "default",
         max_attempts: int = 3,
+        retries: int = 0,
         next_run_at: datetime | None = None,
     ) -> JobRecord:
         """Register a maintained job. Idempotent on (job class, cron).
@@ -58,6 +62,15 @@ class Backend(ABC):
 
     @abstractmethod
     def is_job_cancelled(self, job_id: int) -> bool: ...
+
+    @abstractmethod
+    def increment_job_attempts(self, job_id: int) -> int:
+        """Atomically increment the job's consecutive-failure counter and
+        return the new value."""
+
+    @abstractmethod
+    def reset_job_attempts(self, job_id: int) -> None:
+        """Reset the consecutive-failure counter (called on a successful run)."""
 
     @abstractmethod
     def delete_job(self, job_id: int) -> None:

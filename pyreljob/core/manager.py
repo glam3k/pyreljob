@@ -74,14 +74,17 @@ class JobManager:
         queue: str | None = None,
         priority: int | None = None,
         max_attempts: int = 3,
+        retries: int = 0,
         idempotency_key: str | None = None,
         scheduled_at: datetime | None = None,
     ) -> JobRecord:
         """Create a durable job and its first run.
 
-        ``max_attempts`` is the framework-level retry count applied to every
-        task in the job. With ``idempotency_key``, re-enqueueing the same key
-        returns the existing job instead of duplicating.
+        ``max_attempts`` is the per-task retry budget (a task can override it
+        with ``Task.max_attempts``). ``retries`` is the whole-run retry count:
+        if a run fails, the job re-runs from scratch up to ``retries`` more
+        times. With ``idempotency_key``, re-enqueueing the same key returns
+        the existing job instead of duplicating.
         """
         validate_job(job)
         return self._backend.enqueue(
@@ -90,6 +93,7 @@ class JobManager:
             queue=queue or job.queue,
             priority=priority if priority is not None else job.priority,
             max_attempts=max_attempts,
+            retries=retries,
             idempotency_key=idempotency_key,
             scheduled_at=scheduled_at,
         )
@@ -101,6 +105,7 @@ class JobManager:
         *,
         queue: str | None = None,
         max_attempts: int = 3,
+        retries: int = 0,
     ) -> JobRecord:
         """Register a maintained job.
 
@@ -122,6 +127,7 @@ class JobManager:
             cron,
             queue=queue or job.queue,
             max_attempts=max_attempts,
+            retries=retries,
             next_run_at=next_run,
         )
 

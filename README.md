@@ -323,11 +323,32 @@ framework moves on (true isolation is a v2 concern).
 
 ## Retries & crash safety
 
-Every task in a job is retried up to the job's `max_attempts` (default 3) with
-exponential backoff + jitter (`2^attempt + random` seconds). Task state is
-durable in the `tasks` table, and `ctx` is persisted after every task, so a
-worker that dies mid-run is re-claimed by another worker which **resumes at the
-next unfinished task** — completed work is never repeated.
+Retries work at **two levels** (Temporal-style):
+
+**Task-level** — every task in a job is retried up to the job's `max_attempts`
+(default 3) with exponential backoff + jitter (`2^attempt + random` seconds).
+A task can override its own budget:
+
+```python
+class Charge(Task):
+    max_attempts = 5        # this task retries up to 5 times
+    async def run(self, ctx): ...
+```
+
+**Job-level (whole-run)** — if a run fails after its task retries, the whole
+job re-runs from scratch up to `retries` times:
+
+```python
+manager.enqueue(Booking(...), max_attempts=3, retries=2)
+# -> up to 3 whole-run attempts, each task tried up to 3 times per run
+```
+
+Each whole-run retry is a fresh run with backoff; the consecutive-failure
+counter resets on any successful run.
+
+Task state is durable in the `tasks` table, and `ctx` is persisted after every
+task, so a worker that dies mid-run is re-claimed by another worker which
+**resumes at the next unfinished task** — completed work is never repeated.
 
 ## Inspecting failures
 

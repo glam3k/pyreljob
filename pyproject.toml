@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyreljob"
-version = "0.2.1"
+version = "0.3.0"
 description = "A portable, relational-table-backed job framework for Python (SQLite/PostgreSQL) with a built-in migration framework."
 readme = "README.md"
 requires-python = ">=3.10"

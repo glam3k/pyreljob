@@ -207,19 +207,17 @@ class Worker:
                 existing = records_by_pos.get(start)
                 if existing is not None and (
                     existing.status == TaskStatus.FAILED
-                    and existing.attempts >= job.max_attempts
+                    and existing.attempts >= self._task_budget(cls.tasks[start], job)
                 ):
                     await asyncio.to_thread(self._backend.set_run_ctx, run.id, ctx.as_dict())
                     await self._compensate(run.id, cls, ctx)
-                    await asyncio.to_thread(
-                        self._backend.fail_run, run.id, existing.error or "task exhausted"
-                    )
+                    await self._finalize_failed(job, run.id, existing.error or "task exhausted")
                     await self._reschedule(cls, job, run.id, ctx)
                     return
 
             for pos in range(start, len(cls.tasks)):
                 record = await self._run_task(
-                    run.id, cls, ctx, pos, records_by_pos.get(pos), job.max_attempts
+                    run.id, cls, job, ctx, pos, records_by_pos.get(pos)
                 )
                 if record == "cancel":
                     return
@@ -229,10 +227,31 @@ class Worker:
                     await self._reschedule(cls, job, run.id, ctx)
                     return
             await asyncio.to_thread(self._backend.complete_run, run.id, ctx.results)
+            if job.id is not None:
+                await asyncio.to_thread(self._backend.reset_job_attempts, job.id)
             await self._reschedule(cls, job, run.id, ctx)
             logger.info("run %s: done", run.id)
         finally:
             self._active.pop(run.id, None)
+
+    async def _finalize_failed(
+        self,
+        job: JobRecord,
+        run_id: int,
+        error: str,
+    ) -> None:
+        """Mark a run failed; schedule a whole-run retry if the job has any left."""
+        await asyncio.to_thread(self._backend.fail_run, run_id, error)
+        if job.id is None or job.retries <= 0:
+            return
+        attempts = await asyncio.to_thread(self._backend.increment_job_attempts, job.id)
+        if attempts <= job.retries:
+            retry_at = datetime.now() + timedelta(seconds=self._backoff(attempts))
+            await asyncio.to_thread(self._backend.create_run, job.id, scheduled_at=retry_at)
+            logger.info(
+                "job %s: whole-run attempt %d/%d failed, retrying at %s",
+                job.id, attempts, job.retries, retry_at,
+            )
 
     async def _reschedule(
         self,
@@ -253,12 +272,13 @@ class Worker:
         self,
         run_id: int,
         job_cls: type[Job],
+        job: JobRecord,
         ctx: TaskContext,
         pos: int,
         existing: TaskRecord | None,
-        max_attempts: int,
     ) -> str:
         task_cls = job_cls.tasks[pos]
+        max_attempts = self._task_budget(task_cls, job)
         attempts = (existing.attempts if existing else 0) + 1
 
         await asyncio.to_thread(
@@ -283,7 +303,7 @@ class Worker:
                     self._backend.fail_task, run_id, pos, error, attempts=attempts
                 )
                 await self._compensate(run_id, job_cls, ctx)
-                await asyncio.to_thread(self._backend.fail_run, run_id, error)
+                await self._finalize_failed(job, run_id, error)
                 return "failed"  # run finalized as failed; nothing more to run
             retry_at = datetime.now() + timedelta(seconds=self._backoff(attempts))
             logger.warning(
@@ -306,6 +326,11 @@ class Worker:
         await asyncio.to_thread(self._backend.set_run_ctx, run_id, ctx.as_dict())
         logger.info("run %s: task %s ok", run_id, task_cls.__name__)
         return "ok"
+
+    @staticmethod
+    def _task_budget(task_cls: type[Task], job: JobRecord) -> int:
+        """Per-task retry budget: the task's own override, else the job's."""
+        return task_cls.max_attempts or job.max_attempts
 
     async def _compensate(
         self,

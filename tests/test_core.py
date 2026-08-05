@@ -234,6 +234,18 @@ class ConcurrentJob(Job):
     tasks: ClassVar = [ConcurrentTask]
 
 
+class OverrideFails(Task):
+    max_attempts = 4
+
+    async def run(self, ctx: TaskContext) -> None:
+        raise ValueError("nope")
+
+
+@dataclass
+class OverrideJob(Job):
+    tasks: ClassVar = [OverrideFails]
+
+
 @pytest.fixture()
 def manager(tmp_path):
     m = JobManager(f"sqlite:///{tmp_path}/jobs.db")
@@ -343,6 +355,50 @@ def test_prune_removes_old_terminal_runs(manager):
     assert manager.runs(old_job.id) == []
     assert manager.tasks(old_run.id) == []
     assert manager.runs(recent_job.id)[0].id == recent_run.id  # recent kept
+
+
+def test_task_level_retry_override(manager):
+    # Job says max_attempts=2, but the task overrides with max_attempts=4.
+    job = manager.enqueue(OverrideJob(), max_attempts=2)
+    worker = Worker(manager.backend, retry_backoff=2.0)
+    worker.register(job_cls_path(OverrideJob), OverrideJob)
+    for _ in range(4):
+        tick(worker)
+        run = manager.runs(job.id)[0]
+        if run.status == RunStatus.FAILED:
+            break
+        make_due(manager.backend, run.id)
+    run = manager.runs(job.id)[0]
+    assert run.status == RunStatus.FAILED
+    assert manager.tasks(run.id)[0].attempts == 4  # task's override won
+
+
+def test_job_level_retries(manager):
+    job = manager.enqueue(FailingJob(), max_attempts=1, retries=2)
+    worker = Worker(manager.backend, retry_backoff=2.0)
+    worker.register(job_cls_path(FailingJob), FailingJob)
+
+    tick(worker)  # run 1 fails -> whole-run retry created
+    assert len(manager.runs(job.id)) == 2
+    make_due(manager.backend, manager.runs(job.id)[0].id)
+    tick(worker)  # run 2 fails -> retry created
+    assert len(manager.runs(job.id)) == 3
+    make_due(manager.backend, manager.runs(job.id)[0].id)
+    tick(worker)  # run 3 fails -> retries exhausted, terminal
+
+    runs = manager.runs(job.id)
+    assert len(runs) == 3  # 1 original + 2 retries
+    assert all(r.status == RunStatus.FAILED for r in runs)
+    assert manager.get(job.id).attempts == 3
+
+
+def test_job_attempts_reset_on_success(manager):
+    job = manager.enqueue(Sum(1, 1), retries=2)
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(Sum), Sum)
+    tick(worker)
+    assert manager.runs(job.id)[0].status == RunStatus.SUCCEEDED
+    assert manager.get(job.id).attempts == 0
 
 
 def test_backend_selection(tmp_path):
@@ -826,6 +882,7 @@ def test_migration_upgrades_legacy_v1_schema(tmp_path):
     assert manager.migrate() == [
         "job entities, runs, tasks",
         "add created_at/updated_at timestamps",
+        "add job-level retries",
     ]
 
     with manager.backend._engine.connect() as conn:

@@ -107,10 +107,12 @@ Manager beat ───────────────────►   run_
 
 ## Execution semantics
 
-- **Retries are framework-level, per job**: every task in a job is retried up
-  to the job's `max_attempts` (default 3, tunable at enqueue/schedule time)
-  with exponential backoff + jitter. A task that keeps failing exhausts the
-  budget and the run compensates.
+- **Retries are two-level**: *task-level* — every task is retried up to the
+  job's `max_attempts` (default 3, tunable at enqueue/schedule time), with a
+  per-task `Task.max_attempts` override; *job-level* — if a run fails after its
+  task retries, the whole job re-runs from scratch up to `retries` times (each
+  retry is a fresh run with backoff; a consecutive-failure counter resets on
+  success).
 - **Resumable checkpoints**: `tasks` are durable. If a worker dies, the next
   claim resumes the run at the first non-succeeded task — earlier work is never
   repeated. `ctx` is persisted after every task.
