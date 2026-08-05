@@ -336,6 +336,8 @@ manager.counts()                 # run counts by status
 manager.recent_failures()        # failed runs
 manager.runs(job_id)             # a job's runs
 manager.tasks(run_id)            # per-task state of a run
+manager.delete(job_id)           # hard-delete a job + its runs/tasks (only if no active run)
+manager.prune(older_than=timedelta(days=30))  # drop old terminal runs + their tasks
 ```
 
 There is no separate "replay" concept: retries are automatic, and a terminal

@@ -60,6 +60,18 @@ class Backend(ABC):
     def is_job_cancelled(self, job_id: int) -> bool: ...
 
     @abstractmethod
+    def delete_job(self, job_id: int) -> None:
+        """Hard-delete a job and all its runs and tasks.
+
+        Raises ValueError if the job has a pending or running run.
+        """
+
+    @abstractmethod
+    def prune_runs(self, older_than: datetime) -> int:
+        """Delete terminal runs finished before ``older_than`` (and their
+        tasks). Returns the number of runs deleted."""
+
+    @abstractmethod
     def list_scheduled(self) -> list[JobRecord]:
         """Return active maintained jobs (source=scheduled, not cancelled)."""
 

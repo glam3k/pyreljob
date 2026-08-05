@@ -299,6 +299,52 @@ def test_custom_task_name(manager):
     assert UNDONE == ["send-email"]
 
 
+def test_delete_job(manager):
+    job = manager.enqueue(Sum(1, 1))
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(Sum), Sum)
+    tick(worker)
+    run = manager.runs(job.id)[0]
+    assert run.status == RunStatus.SUCCEEDED
+
+    manager.delete(job.id)
+    assert manager.get(job.id) is None
+    assert manager.runs(job.id) == []
+    assert manager.tasks(run.id) == []
+
+
+def test_delete_refuses_active_job(manager):
+    job = manager.enqueue(SlowJob())  # never run; still pending
+    with pytest.raises(ValueError):
+        manager.delete(job.id)
+    assert manager.get(job.id) is not None
+
+
+def test_prune_removes_old_terminal_runs(manager):
+    old_job = manager.enqueue(Sum(1, 1))
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(Sum), Sum)
+    tick(worker)
+    old_run = manager.runs(old_job.id)[0]
+    assert old_run.status == RunStatus.SUCCEEDED
+    with manager.backend._engine.begin() as conn:
+        conn.execute(
+            update(RunModel)
+            .where(RunModel.id == old_run.id)
+            .values(finished_at=datetime.now() - timedelta(days=40))
+        )
+
+    recent_job = manager.enqueue(Sum(2, 2))
+    tick(worker)
+    recent_run = manager.runs(recent_job.id)[0]
+
+    deleted = manager.prune(older_than=timedelta(days=30))
+    assert deleted == 1
+    assert manager.runs(old_job.id) == []
+    assert manager.tasks(old_run.id) == []
+    assert manager.runs(recent_job.id)[0].id == recent_run.id  # recent kept
+
+
 def test_backend_selection(tmp_path):
     from pyreljob.backends.sqlalchemy_backend import (
         SQLiteBackend,

@@ -132,6 +132,19 @@ class JobManager:
         """
         self._backend.cancel_job(job_id)
 
+    def delete(self, job_id: int) -> None:
+        """Hard-delete a job and all its runs and tasks.
+
+        Raises ValueError if the job has a pending or running run — cancel it
+        first.
+        """
+        self._backend.delete_job(job_id)
+
+    def prune(self, older_than: timedelta) -> int:
+        """Delete terminal runs (and their tasks) finished before
+        ``now - older_than``. Returns the number of runs deleted."""
+        return self._backend.prune_runs(datetime.now() - older_than)
+
     async def undo(self, job_id: int) -> None:
         """Manually compensate a job's most recent run (saga pattern).
 

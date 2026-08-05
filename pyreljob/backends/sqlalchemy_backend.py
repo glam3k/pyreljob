@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Engine, and_, case, exists, func, insert, or_, select, update
+from sqlalchemy import Engine, and_, case, delete, exists, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -164,6 +164,47 @@ class SQLAlchemyBackend(Backend):
         with Session(self._engine) as session:
             model = session.get(JobModel, job_id)
             return model is not None and model.status == JobStatus.CANCELLED
+
+    def delete_job(self, job_id: int) -> None:
+        with Session(self._engine) as session:
+            active = session.execute(
+                select(RunModel.id).where(
+                    RunModel.job_id == job_id,
+                    RunModel.status.in_([RunStatus.PENDING, RunStatus.RUNNING]),
+                )
+            ).first()
+            if active is not None:
+                raise ValueError(
+                    "cannot delete a job with pending or running runs; cancel it first"
+                )
+        with self._engine.begin() as conn:
+            run_ids = [
+                row[0]
+                for row in conn.execute(
+                    select(RunModel.id).where(RunModel.job_id == job_id)
+                )
+            ]
+            if run_ids:
+                conn.execute(delete(TaskModel).where(TaskModel.run_id.in_(run_ids)))
+                conn.execute(delete(RunModel).where(RunModel.job_id == job_id))
+            conn.execute(delete(JobModel).where(JobModel.id == job_id))
+
+    def prune_runs(self, older_than: datetime) -> int:
+        with Session(self._engine) as session:
+            run_ids = session.execute(
+                select(RunModel.id).where(
+                    RunModel.status.in_(
+                        [RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED]
+                    ),
+                    RunModel.finished_at < older_than,
+                )
+            ).scalars().all()
+        if not run_ids:
+            return 0
+        with self._engine.begin() as conn:
+            conn.execute(delete(TaskModel).where(TaskModel.run_id.in_(run_ids)))
+            conn.execute(delete(RunModel).where(RunModel.id.in_(run_ids)))
+        return len(run_ids)
 
     def list_scheduled(self) -> list[JobRecord]:
         with Session(self._engine) as session:
