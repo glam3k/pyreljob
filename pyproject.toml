@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyreljob"
+version = "0.1.0"
+description = "A portable, relational-table-backed job framework for Python (SQLite/PostgreSQL) with a built-in migration framework."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["jobs", "queue", "worker", "cron", "sqlite", "postgres", "migration"]
+authors = [{ name = "glam3k", email = "glam3k@users.noreply.github.com" }]
+dependencies = [
+    "SQLAlchemy>=2.0",
+    "croniter>=2.0",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.urls]
+Homepage = "https://github.com/glam3k/pyreljob"
+Repository = "https://github.com/glam3k/pyreljob"
+Issues = "https://github.com/glam3k/pyreljob/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyreljob"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# DTZ rules assume tz-aware datetimes; pyreljob uses naive timestamps so the
+# schema maps cleanly onto both SQLite and PostgreSQL.
+ignore = ["DTZ"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = ["croniter"]
+ignore_missing_imports = true

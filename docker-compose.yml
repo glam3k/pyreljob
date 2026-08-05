@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pyreljob
+      POSTGRES_PASSWORD: pyreljob
+      POSTGRES_DB: pyreljob
+    ports:
+      - "5433:5432"
+    volumes:
+      - pyreljob_pgdata:/var/lib/postgresql/data
+
+volumes:
+  pyreljob_pgdata:
