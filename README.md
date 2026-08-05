@@ -29,10 +29,20 @@ See [`DESIGN.md`](DESIGN.md) for the full architecture and semantics.
 
 ## Install
 
+From GitHub (current source of truth — the repo is public):
+
 ```bash
-pip install pyreljob                # sqlite works out of the box
-pip install 'pyreljob[postgres]'    # + psycopg for PostgreSQL
+pip install "git+https://github.com/glam3k/pyreljob.git"            # sqlite works out of the box
+pip install "git+https://github.com/glam3k/pyreljob.git#egg=pyreljob[postgres]"
 ```
+
+Pin a version (tag or commit) for reproducibility in `requirements.txt`:
+
+```
+pyreljob @ git+https://github.com/glam3k/pyreljob.git@v0.1.0
+```
+
+(In a `requirements.txt`, `#egg=` isn't needed for PEP 508.)
 
 ## Quick start
 
