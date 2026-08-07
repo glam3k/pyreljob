@@ -18,7 +18,6 @@ from croniter import croniter
 from pyreljob.backends.base import Backend
 from pyreljob.backends.sqlalchemy_backend import backend_from_url
 from pyreljob.core.job import JobRecord, RunRecord, TaskRecord, TaskStatus
-from pyreljob.signals import install_shutdown_handler
 from pyreljob.task import (
     Job,
     TaskContext,
@@ -208,10 +207,23 @@ class JobManager:
         """Run the beat loop: fire due cron jobs until interrupted.
 
         Durable runs are created for each maintained job as its cron comes
-        due. Graceful on SIGINT/SIGTERM.
+        due.
         """
+
+        import signal
+        import threading
+
+        if threading.current_thread() is threading.main_thread():
+            def handle_signal():
+                self.stop()
+
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    signal.signal(sig, lambda s, f: handle_signal())
+                except (ValueError, OSError):
+                    pass
+
         self._misfire_grace_seconds = misfire_grace_seconds
-        install_shutdown_handler(self.stop)
         self._running = True
         try:
             while self._running:

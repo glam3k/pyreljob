@@ -27,7 +27,6 @@ from typing import Any
 
 from pyreljob.backends.base import Backend
 from pyreljob.core.job import JobRecord, JobStatus, RunRecord, TaskRecord, TaskStatus
-from pyreljob.signals import install_shutdown_handler
 from pyreljob.task import (
     Job,
     JobCancelledError,
@@ -79,12 +78,21 @@ class Worker:
         return self._worker_id
 
     def run_forever(self) -> None:
-        """Poll for and execute runs until interrupted (SIGINT/SIGTERM).
+        """Poll for and execute runs until interrupted (SIGINT/SIGTERM)."""
 
-        Up to ``max_concurrency`` runs execute concurrently; on shutdown the
-        in-flight runs drain to completion before exiting.
-        """
-        install_shutdown_handler(self.stop)
+        import signal
+        import threading
+
+        if threading.current_thread() is threading.main_thread():
+            def handle_signal():
+                self.stop()
+
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    signal.signal(sig, lambda s, f: handle_signal())
+                except (ValueError, OSError):
+                    pass
+
         self._running = True
         logger.info(
             "worker %s started (queue=%s, max_concurrency=%d)",
