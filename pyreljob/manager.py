@@ -74,6 +74,7 @@ class JobManager:
         retries: int = 0,
         idempotency_key: str | None = None,
         scheduled_at: datetime | None = None,
+        tags: list[str] | None = None,
     ) -> JobRecord:
         """Create a durable job and its first run.
 
@@ -81,7 +82,8 @@ class JobManager:
         with ``Task.max_attempts``). ``retries`` is the whole-run retry count:
         if a run fails, the job re-runs from scratch up to ``retries`` more
         times. With ``idempotency_key``, re-enqueueing the same key returns
-        the existing job instead of duplicating.
+        the existing job instead of duplicating. ``tags`` are app-agnostic
+        strings (e.g. an owner id) used to scope jobs.
         """
         validate_job(job)
         return self._backend.enqueue(
@@ -93,6 +95,7 @@ class JobManager:
             retries=retries,
             idempotency_key=idempotency_key,
             scheduled_at=scheduled_at,
+            tags=tags,
         )
 
     def schedule(
@@ -102,6 +105,7 @@ class JobManager:
         queue: str | None = None,
         max_attempts: int = 3,
         retries: int = 0,
+        tags: list[str] | None = None,
     ) -> JobRecord:
         """Register a maintained job.
 
@@ -121,6 +125,7 @@ class JobManager:
             max_attempts=max_attempts,
             retries=retries,
             next_run_at=next_run,
+            tags=tags,
         )
 
     def cancel(self, job_id: int) -> None:
@@ -175,9 +180,11 @@ class JobManager:
     def get(self, job_id: int) -> JobRecord | None:
         return self._backend.get(job_id)
 
-    def list_jobs(self, *, limit: int = 100, offset: int = 0) -> list[JobRecord]:
-        """All jobs, newest first, with pagination."""
-        return self._backend.list_jobs(limit=limit, offset=offset)
+    def list_jobs(
+        self, *, limit: int = 100, offset: int = 0, tag: str | None = None
+    ) -> list[JobRecord]:
+        """All jobs, newest first, with pagination and optional tag filter."""
+        return self._backend.list_jobs(limit=limit, offset=offset, tag=tag)
 
     def runs(self, job_id: int) -> list[RunRecord]:
         """The runs (invocations) of a job, newest first."""

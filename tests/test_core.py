@@ -472,6 +472,27 @@ def test_enqueue_rejects_non_serializable(manager):
         manager.enqueue(NotSerializable())
 
 
+def test_job_tags_roundtrip_and_filter(manager):
+    manager.enqueue(Sum(1, 2), tags=["user:1", "crm"])
+    manager.enqueue(Sum(3, 4), tags=["user:2"])
+    manager.enqueue(Sum(5, 6))
+
+    all_jobs = manager.list_jobs()
+    assert len(all_jobs) == 3
+    assert all(j.tags is not None for j in all_jobs if j.tags)
+
+    scoped = manager.list_jobs(tag="user:1")
+    assert len(scoped) == 1
+    assert scoped[0].tags == ["user:1", "crm"]
+
+    scoped = manager.list_jobs(tag="user:2")
+    assert len(scoped) == 1
+    assert scoped[0].tags == ["user:2"]
+
+    untagged = manager.list_jobs(tag="user:3")
+    assert untagged == []
+
+
 def test_plain_job_class_with_custom_serialization(manager):
     class CustomJob(Job):
         tasks: ClassVar = [Add]
@@ -971,6 +992,7 @@ def test_migration_upgrades_legacy_v1_schema(tmp_path):
         "drop cron column",
         "rename pending runs/tasks to ready",
         "add run progress column",
+        "add job tags column",
     ]
 
     with manager.backend._engine.connect() as conn:

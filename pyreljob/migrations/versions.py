@@ -262,6 +262,17 @@ def _add_run_progress(conn: Connection) -> None:
         conn.execute(text("ALTER TABLE runs ADD COLUMN progress REAL"))
 
 
+def _add_job_tags(conn: Connection) -> None:
+    """v10: app-agnostic tags on jobs (e.g. an owner/user id, category).
+
+    Tags are a JSON array of strings. Apps use them to scope jobs to a user
+    or group without the framework knowing about users.
+    """
+    columns = {c["name"] for c in inspect(conn).get_columns("jobs")}
+    if "tags" not in columns:
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN tags JSON"))
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "create jobs table", _create_jobs_table),
     Migration(2, "index job schedule", _create_schedule_index),
@@ -272,4 +283,5 @@ MIGRATIONS: list[Migration] = [
     Migration(7, "drop cron column", _drop_cron_column),
     Migration(8, "rename pending runs/tasks to ready", _rename_pending_to_ready),
     Migration(9, "add run progress column", _add_run_progress),
+    Migration(10, "add job tags column", _add_job_tags),
 ]

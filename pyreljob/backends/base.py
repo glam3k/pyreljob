@@ -26,13 +26,15 @@ class Backend(ABC):
         retries: int = 0,
         idempotency_key: str | None = None,
         scheduled_at: datetime | None = None,
+        tags: list[str] | None = None,
     ) -> JobRecord:
         """Create a durable job and its first run.
 
         ``max_attempts`` is the per-task retry budget; ``retries`` is the
         whole-run retry count (how many times to re-run the job after a failed
         run). With ``idempotency_key``, returns the existing job instead of
-        creating a duplicate. ``scheduled_at`` delays the first run.
+        creating a duplicate. ``scheduled_at`` delays the first run. ``tags``
+        are app-agnostic strings (e.g. an owner id) used to scope jobs.
         """
 
     @abstractmethod
@@ -45,6 +47,7 @@ class Backend(ABC):
         max_attempts: int = 3,
         retries: int = 0,
         next_run_at: datetime | None = None,
+        tags: list[str] | None = None,
     ) -> JobRecord:
         """Register a maintained job. Idempotent on job class.
 
@@ -57,9 +60,9 @@ class Backend(ABC):
 
     @abstractmethod
     def list_jobs(
-        self, *, limit: int = 100, offset: int = 0
+        self, *, limit: int = 100, offset: int = 0, tag: str | None = None
     ) -> list[JobRecord]:
-        """Return jobs, newest first, with pagination."""
+        """Return jobs, newest first, with pagination and optional tag filter."""
 
     @abstractmethod
     def cancel_job(self, job_id: int) -> None:

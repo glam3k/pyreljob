@@ -57,6 +57,7 @@ class JobRecord:
     retries: int = 0
     attempts: int = 0
     idempotency_key: str | None = None
+    tags: list[str] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -75,6 +76,7 @@ class JobRecord:
             retries=model.retries,
             attempts=model.attempts,
             idempotency_key=model.idempotency_key,
+            tags=model.tags,
             created_at=model.created_at,
             updated_at=model.updated_at,
         )

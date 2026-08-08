@@ -15,7 +15,20 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Engine, and_, case, delete, exists, func, insert, or_, select, update
+from sqlalchemy import (
+    Engine,
+    String,
+    and_,
+    case,
+    cast,
+    delete,
+    exists,
+    func,
+    insert,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -60,6 +73,7 @@ class SQLAlchemyBackend(Backend):
         retries: int = 0,
         idempotency_key: str | None = None,
         scheduled_at: datetime | None = None,
+        tags: list[str] | None = None,
     ) -> JobRecord:
         key = idempotency_key
         if key is not None:
@@ -75,6 +89,7 @@ class SQLAlchemyBackend(Backend):
             max_attempts=max_attempts,
             retries=retries,
             idempotency_key=key,
+            tags=tags,
             updated_at=datetime.now(),
         )
         try:
@@ -111,6 +126,7 @@ class SQLAlchemyBackend(Backend):
         max_attempts: int = 3,
         retries: int = 0,
         next_run_at: datetime | None = None,
+        tags: list[str] | None = None,
     ) -> JobRecord:
         with Session(self._engine) as session:
             existing = session.execute(
@@ -130,6 +146,7 @@ class SQLAlchemyBackend(Backend):
             max_attempts=max_attempts,
             retries=retries,
             next_run_at=next_run_at,
+            tags=tags,
             updated_at=datetime.now(),
         )
         with Session(self._engine) as session:
@@ -195,15 +212,10 @@ class SQLAlchemyBackend(Backend):
                 )
             ).first()
             if active is not None:
-                raise ValueError(
-                    "cannot delete a job with ready or running runs; cancel it first"
-                )
+                raise ValueError("cannot delete a job with ready or running runs; cancel it first")
         with self._engine.begin() as conn:
             run_ids = [
-                row[0]
-                for row in conn.execute(
-                    select(RunModel.id).where(RunModel.job_id == job_id)
-                )
+                row[0] for row in conn.execute(select(RunModel.id).where(RunModel.job_id == job_id))
             ]
             if run_ids:
                 conn.execute(delete(TaskModel).where(TaskModel.run_id.in_(run_ids)))
@@ -212,14 +224,18 @@ class SQLAlchemyBackend(Backend):
 
     def prune_runs(self, older_than: datetime) -> int:
         with Session(self._engine) as session:
-            run_ids = session.execute(
-                select(RunModel.id).where(
-                    RunModel.status.in_(
-                        [RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED]
-                    ),
-                    RunModel.finished_at < older_than,
+            run_ids = (
+                session.execute(
+                    select(RunModel.id).where(
+                        RunModel.status.in_(
+                            [RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED]
+                        ),
+                        RunModel.finished_at < older_than,
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         if not run_ids:
             return 0
         with self._engine.begin() as conn:
@@ -244,19 +260,18 @@ class SQLAlchemyBackend(Backend):
             return [JobRecord.from_model(m) for m in models]
 
     def list_jobs(
-        self, *, limit: int = 100, offset: int = 0
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        tag: str | None = None,
     ) -> list[JobRecord]:
         with Session(self._engine) as session:
-            models = (
-                session.execute(
-                    select(JobModel)
-                    .order_by(JobModel.id.desc())
-                    .offset(offset)
-                    .limit(limit)
-                )
-                .scalars()
-                .all()
-            )
+            stmt = select(JobModel).order_by(JobModel.id.desc())
+            if tag is not None:
+                stmt = stmt.where(cast(JobModel.tags, String).contains(f'"{tag}"'))
+            stmt = stmt.offset(offset).limit(limit)
+            models = session.execute(stmt).scalars().all()
             return [JobRecord.from_model(m) for m in models]
 
     def claim_scheduled(self, job_id: int, next_run_at: datetime | None) -> bool:
@@ -463,9 +478,7 @@ class SQLAlchemyBackend(Backend):
         with Session(self._engine) as session:
             models = (
                 session.execute(
-                    select(RunModel)
-                    .where(RunModel.job_id == job_id)
-                    .order_by(RunModel.id.desc())
+                    select(RunModel).where(RunModel.job_id == job_id).order_by(RunModel.id.desc())
                 )
                 .scalars()
                 .all()
@@ -542,8 +555,7 @@ class SQLAlchemyBackend(Backend):
             ).scalar_one_or_none()
             if existing is None:
                 conn.execute(
-                    insert(TaskModel)
-                    .values(
+                    insert(TaskModel).values(
                         run_id=run_id,
                         position=position,
                         task_name=task_name,
@@ -634,4 +646,3 @@ class SQLAlchemyBackend(Backend):
                     updated_at=datetime.now(),
                 )
             )
-
