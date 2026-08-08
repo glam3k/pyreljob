@@ -243,6 +243,22 @@ class SQLAlchemyBackend(Backend):
             )
             return [JobRecord.from_model(m) for m in models]
 
+    def list_jobs(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[JobRecord]:
+        with Session(self._engine) as session:
+            models = (
+                session.execute(
+                    select(JobModel)
+                    .order_by(JobModel.id.desc())
+                    .offset(offset)
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return [JobRecord.from_model(m) for m in models]
+
     def claim_scheduled(self, job_id: int, next_run_at: datetime | None) -> bool:
         now = datetime.now()
         run_in_flight = exists(

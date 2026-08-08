@@ -56,6 +56,12 @@ class Backend(ABC):
     def get(self, job_id: int) -> JobRecord | None: ...
 
     @abstractmethod
+    def list_jobs(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[JobRecord]:
+        """Return jobs, newest first, with pagination."""
+
+    @abstractmethod
     def cancel_job(self, job_id: int) -> None:
         """Mark a job cancelled (stops future runs and its active run)."""
 

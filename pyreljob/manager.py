@@ -175,6 +175,10 @@ class JobManager:
     def get(self, job_id: int) -> JobRecord | None:
         return self._backend.get(job_id)
 
+    def list_jobs(self, *, limit: int = 100, offset: int = 0) -> list[JobRecord]:
+        """All jobs, newest first, with pagination."""
+        return self._backend.list_jobs(limit=limit, offset=offset)
+
     def runs(self, job_id: int) -> list[RunRecord]:
         """The runs (invocations) of a job, newest first."""
         return self._backend.runs(job_id)
