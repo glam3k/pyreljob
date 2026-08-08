@@ -39,6 +39,7 @@ from pyreljob.job import (
     JobStatus,
     RunRecord,
     RunStatus,
+    RunWithJob,
     TaskRecord,
     TaskStatus,
 )
@@ -484,6 +485,28 @@ class SQLAlchemyBackend(Backend):
                 .all()
             )
             return [RunRecord.from_model(m) for m in models]
+
+    def list_runs(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        tag: str | None = None,
+    ) -> list[RunWithJob]:
+        with Session(self._engine) as session:
+            stmt = (
+                select(RunModel, JobModel)
+                .join(JobModel, JobModel.id == RunModel.job_id)
+                .order_by(RunModel.id.desc())
+            )
+            if tag is not None:
+                stmt = stmt.where(cast(JobModel.tags, String).contains(f'"{tag}"'))
+            stmt = stmt.offset(offset).limit(limit)
+            rows = session.execute(stmt).all()
+            return [
+                RunWithJob(run=RunRecord.from_model(run), job=JobRecord.from_model(job))
+                for run, job in rows
+            ]
 
     def recent_failures(self, limit: int = 10) -> list[RunRecord]:
         with Session(self._engine) as session:

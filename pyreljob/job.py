@@ -128,6 +128,19 @@ class RunRecord:
 
 
 @dataclass
+class RunWithJob:
+    """A run joined to its owning job.
+
+    Returned by :meth:`JobManager.list_runs` so the UI can list runs directly
+    (each is an actual execution) while still carrying the job's context
+    (name, source, args, tags) for display and owner scoping.
+    """
+
+    run: RunRecord
+    job: JobRecord
+
+
+@dataclass
 class TaskRecord:
     id: int | None = None
     run_id: int = 0

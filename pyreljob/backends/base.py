@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from pyreljob.job import JobRecord, RunRecord, TaskRecord
+from pyreljob.job import JobRecord, RunRecord, RunWithJob, TaskRecord
 
 
 class Backend(ABC):
@@ -167,6 +167,15 @@ class Backend(ABC):
     @abstractmethod
     def runs(self, job_id: int) -> list[RunRecord]:
         """All runs of a job, newest first."""
+
+    @abstractmethod
+    def list_runs(
+        self, *, limit: int = 100, offset: int = 0, tag: str | None = None
+    ) -> list[RunWithJob]:
+        """All runs across jobs, newest first, joined to their owning job.
+
+        ``tag`` filters by the owning job's tags (e.g. ``user:<id>``).
+        """
 
     @abstractmethod
     def recent_failures(self, limit: int = 10) -> list[RunRecord]:

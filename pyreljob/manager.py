@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 from pyreljob.backends import backend_from_url
 from pyreljob.backends.base import Backend
-from pyreljob.job import JobRecord, RunRecord, TaskRecord, TaskStatus
+from pyreljob.job import JobRecord, RunRecord, RunWithJob, TaskRecord, TaskStatus
 from pyreljob.task import (
     Job,
     TaskContext,
@@ -189,6 +189,16 @@ class JobManager:
     def runs(self, job_id: int) -> list[RunRecord]:
         """The runs (invocations) of a job, newest first."""
         return self._backend.runs(job_id)
+
+    def list_runs(
+        self, *, limit: int = 100, offset: int = 0, tag: str | None = None
+    ) -> list[RunWithJob]:
+        """All runs across jobs, newest first, each joined to its owning job.
+
+        ``tag`` filters by the owning job's tags (e.g. ``user:<id>``). This is
+        the runs-first view for dashboards — every entry is one execution.
+        """
+        return self._backend.list_runs(limit=limit, offset=offset, tag=tag)
 
     def tasks(self, run_id: int) -> list[TaskRecord]:
         """The task executions of a specific run."""

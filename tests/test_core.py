@@ -493,6 +493,50 @@ def test_job_tags_roundtrip_and_filter(manager):
     assert untagged == []
 
 
+def test_list_runs_joins_owning_job(manager):
+    first = manager.enqueue(Sum(1, 2), tags=["user:1", "crm"])
+    second = manager.enqueue(Sum(3, 4), tags=["user:2"])
+    untagged = manager.enqueue(Sum(5, 6))
+
+    runs = manager.list_runs()
+    assert len(runs) == 3
+    newest = runs[0]
+    assert newest.run.status == RunStatus.READY
+    assert newest.job.id == untagged.id
+    assert newest.job.tags is None
+
+    scoped = manager.list_runs(tag="user:1")
+    assert len(scoped) == 1
+    assert scoped[0].job.id == first.id
+    assert scoped[0].job.tags == ["user:1", "crm"]
+
+    scoped = manager.list_runs(tag="user:2")
+    assert len(scoped) == 1
+    assert scoped[0].job.id == second.id
+
+    empty = manager.list_runs(tag="user:3")
+    assert empty == []
+
+    # A maintained job re-fires many runs; each appears as its own entry.
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(Poller), Poller)
+    for _ in range(3):
+        tick(worker)  # drain the earlier Sum runs first
+    scheduled = manager.schedule(Poller(), tags=["user:9"])
+    manager.tick()  # fire run 1 (first schedule fires now)
+    tick(worker)  # execute run 1 -> re-arms next_runtime
+    with manager.backend._engine.begin() as conn:
+        conn.execute(
+            update(JobModel)
+            .where(JobModel.id == scheduled.id)
+            .values(next_run_at=datetime.now() - timedelta(seconds=1))
+        )
+    manager.tick()  # fire run 2
+    runs = manager.list_runs(tag="user:9")
+    assert len(runs) == 2
+    assert {r.job.id for r in runs} == {scheduled.id}
+
+
 def test_plain_job_class_with_custom_serialization(manager):
     class CustomJob(Job):
         tasks: ClassVar = [Add]
