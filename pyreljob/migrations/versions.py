@@ -241,6 +241,27 @@ def _add_job_retries(conn: Connection) -> None:
         )
 
 
+def _drop_cron_column(conn: Connection) -> None:
+    """v7: cron removed; ``Job.next_runtime`` is the only scheduling mechanism."""
+    columns = {c["name"] for c in inspect(conn).get_columns("jobs")}
+    if "cron" in columns:
+        conn.execute(text("ALTER TABLE jobs DROP COLUMN cron"))
+
+
+def _rename_pending_to_ready(conn: Connection) -> None:
+    """v8: runs/tasks waiting to be claimed are ``ready``, not ``pending``."""
+    conn.execute(text("UPDATE runs SET status = 'ready' WHERE status = 'pending'"))
+    conn.execute(text("UPDATE tasks SET status = 'ready' WHERE status = 'pending'"))
+
+
+def _add_run_progress(conn: Connection) -> None:
+    """v9: optional run progress — a float in [0, 1] reported by job logic or
+    auto-filled by the worker as tasks complete. NULL means "not reported"."""
+    columns = {c["name"] for c in inspect(conn).get_columns("runs")}
+    if "progress" not in columns:
+        conn.execute(text("ALTER TABLE runs ADD COLUMN progress REAL"))
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "create jobs table", _create_jobs_table),
     Migration(2, "index job schedule", _create_schedule_index),
@@ -248,4 +269,7 @@ MIGRATIONS: list[Migration] = [
     Migration(4, "job entities, runs, tasks", _job_run_task_model),
     Migration(5, "add created_at/updated_at timestamps", _add_timestamps),
     Migration(6, "add job-level retries", _add_job_retries),
+    Migration(7, "drop cron column", _drop_cron_column),
+    Migration(8, "rename pending runs/tasks to ready", _rename_pending_to_ready),
+    Migration(9, "add run progress column", _add_run_progress),
 ]

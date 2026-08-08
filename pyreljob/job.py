@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from pyreljob.orm import JobModel, RunModel, TaskModel
+from pyreljob.models.orm import JobModel, RunModel, TaskModel
 
 
 class JobStatus:
@@ -27,7 +27,7 @@ class JobSource:
 
 
 class RunStatus:
-    PENDING = "pending"
+    READY = "ready"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -35,7 +35,7 @@ class RunStatus:
 
 
 class TaskStatus:
-    PENDING = "pending"
+    READY = "ready"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -52,7 +52,6 @@ class JobRecord:
     args: dict[str, Any] | None = None
     priority: int = 0
     source: str = JobSource.ON_DEMAND
-    cron: str | None = None
     next_run_at: datetime | None = None
     max_attempts: int = 3
     retries: int = 0
@@ -71,7 +70,6 @@ class JobRecord:
             args=model.args,
             priority=model.priority,
             source=model.source,
-            cron=model.cron,
             next_run_at=model.next_run_at,
             max_attempts=model.max_attempts,
             retries=model.retries,
@@ -89,11 +87,12 @@ class JobRecord:
 class RunRecord:
     id: int | None = None
     job_id: int = 0
-    status: str = RunStatus.PENDING
+    status: str = RunStatus.READY
     result: Any = None
     error: str | None = None
     ctx: dict[str, Any] | None = None
     worker_id: str | None = None
+    progress: float | None = None
     scheduled_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -110,6 +109,7 @@ class RunRecord:
             error=model.error,
             ctx=model.ctx,
             worker_id=model.worker_id,
+            progress=model.progress,
             scheduled_at=model.scheduled_at,
             created_at=model.created_at,
             updated_at=model.updated_at,
@@ -131,7 +131,7 @@ class TaskRecord:
     run_id: int = 0
     position: int = 0
     task_name: str = ""
-    status: str = TaskStatus.PENDING
+    status: str = TaskStatus.READY
     result: Any = None
     error: str | None = None
     attempts: int = 0

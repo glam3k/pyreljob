@@ -1,11 +1,13 @@
-"""SQLAlchemy backend — shared base + thin dialect subclasses.
+"""SQLAlchemy backend — the shared portability layer.
 
 ``SQLAlchemyBackend`` holds everything the two dialects share (SQLAlchemy is
-the portability layer). ``SQLiteBackend`` and ``PostgresBackend`` override only
-the genuinely dialect-specific parts — today that's just :meth:`claim`:
-PostgreSQL gets ``FOR UPDATE SKIP LOCKED`` (Graphile-worker style), SQLite uses
-the portable conditional-UPDATE claim. Postgres-only features (e.g. worker
-wake-up via LISTEN/NOTIFY) have a clean home in ``PostgresBackend``.
+the portability layer). The dialect subclasses live in
+:mod:`pyreljob.backends.sqlite` and :mod:`pyreljob.backends.postgres`, and
+override only the genuinely dialect-specific parts — today that's just
+:meth:`claim`: PostgreSQL gets ``FOR UPDATE SKIP LOCKED`` (Graphile-worker
+style), SQLite uses the portable conditional-UPDATE claim. Postgres-only
+features (e.g. worker wake-up via LISTEN/NOTIFY) have a clean home in
+``PostgresBackend``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from pyreljob.backends.base import Backend
-from pyreljob.core.job import (
+from pyreljob.job import (
     JobRecord,
     JobSource,
     JobStatus,
@@ -29,7 +31,7 @@ from pyreljob.core.job import (
 )
 from pyreljob.migrations.runner import MigrationRunner
 from pyreljob.migrations.versions import MIGRATIONS
-from pyreljob.orm import JobModel, RunModel, TaskModel
+from pyreljob.models.orm import JobModel, RunModel, TaskModel
 
 
 class SQLAlchemyBackend(Backend):
@@ -104,7 +106,6 @@ class SQLAlchemyBackend(Backend):
         self,
         job: str,
         args: Any = None,
-        cron: str | None = None,
         *,
         queue: str = "default",
         max_attempts: int = 3,
@@ -115,7 +116,6 @@ class SQLAlchemyBackend(Backend):
             existing = session.execute(
                 select(JobModel).where(
                     JobModel.job == job,
-                    JobModel.cron == cron,
                     JobModel.source == JobSource.SCHEDULED,
                 )
             ).scalar_one_or_none()
@@ -127,7 +127,6 @@ class SQLAlchemyBackend(Backend):
             args=args,
             priority=0,
             source=JobSource.SCHEDULED,
-            cron=cron,
             max_attempts=max_attempts,
             retries=retries,
             next_run_at=next_run_at,
@@ -154,7 +153,7 @@ class SQLAlchemyBackend(Backend):
                 update(RunModel)
                 .where(
                     RunModel.job_id == job_id,
-                    RunModel.status.in_([RunStatus.PENDING, RunStatus.RUNNING]),
+                    RunModel.status.in_([RunStatus.READY, RunStatus.RUNNING]),
                 )
                 .values(
                     status=RunStatus.CANCELLED,
@@ -192,12 +191,12 @@ class SQLAlchemyBackend(Backend):
             active = session.execute(
                 select(RunModel.id).where(
                     RunModel.job_id == job_id,
-                    RunModel.status.in_([RunStatus.PENDING, RunStatus.RUNNING]),
+                    RunModel.status.in_([RunStatus.READY, RunStatus.RUNNING]),
                 )
             ).first()
             if active is not None:
                 raise ValueError(
-                    "cannot delete a job with pending or running runs; cancel it first"
+                    "cannot delete a job with ready or running runs; cancel it first"
                 )
         with self._engine.begin() as conn:
             run_ids = [
@@ -249,7 +248,7 @@ class SQLAlchemyBackend(Backend):
         run_in_flight = exists(
             select(RunModel.id).where(
                 RunModel.job_id == JobModel.id,
-                RunModel.status.in_([RunStatus.PENDING, RunStatus.RUNNING]),
+                RunModel.status.in_([RunStatus.READY, RunStatus.RUNNING]),
             )
         )
         with self._engine.begin() as conn:
@@ -278,7 +277,7 @@ class SQLAlchemyBackend(Backend):
 
     def _run_ready_clause(self, now: datetime, lease_expiry: datetime) -> Any:
         ready = and_(
-            RunModel.status == RunStatus.PENDING,
+            RunModel.status == RunStatus.READY,
             (RunModel.scheduled_at.is_(None)) | (RunModel.scheduled_at <= now),
         )
         reclaim = and_(
@@ -302,7 +301,7 @@ class SQLAlchemyBackend(Backend):
         now = datetime.now()
         lease_expiry = datetime.now() - timedelta(seconds=lease_seconds)
         ready = and_(
-            RunModel.status == RunStatus.PENDING,
+            RunModel.status == RunStatus.READY,
             (RunModel.scheduled_at.is_(None)) | (RunModel.scheduled_at <= now),
         )
         reclaim = and_(
@@ -388,7 +387,7 @@ class SQLAlchemyBackend(Backend):
                     update(RunModel)
                     .where(RunModel.id == run_id, RunModel.status == RunStatus.RUNNING)
                     .values(
-                        status=RunStatus.PENDING,
+                        status=RunStatus.READY,
                         error=error,
                         scheduled_at=retry_at,
                         finished_at=None,
@@ -429,6 +428,14 @@ class SQLAlchemyBackend(Backend):
                 update(RunModel)
                 .where(RunModel.id == run_id)
                 .values(ctx=ctx, updated_at=datetime.now())
+            )
+
+    def set_run_progress(self, run_id: int, progress: float | None) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(RunModel)
+                .where(RunModel.id == run_id)
+                .values(progress=progress, updated_at=datetime.now())
             )
 
     def get_run(self, run_id: int) -> RunRecord | None:
@@ -612,86 +619,3 @@ class SQLAlchemyBackend(Backend):
                 )
             )
 
-
-class SQLiteBackend(SQLAlchemyBackend):
-    """SQLite-specific backend.
-
-    Uses the portable conditional-UPDATE claim (SQLite has no
-    ``FOR UPDATE SKIP LOCKED``). SQLite-only tweaks live here.
-    """
-
-
-class PostgresBackend(SQLAlchemyBackend):
-    """PostgreSQL-specific backend.
-
-    Claims runs with ``SELECT ... FOR UPDATE SKIP LOCKED`` so concurrent
-    workers never block each other on the same rows.
-    """
-
-    def claim(
-        self,
-        worker_id: str,
-        queue: str | None = None,
-        *,
-        lease_seconds: int = 30,
-    ) -> RunRecord | None:
-        now = datetime.now()
-        lease_expiry = datetime.now() - timedelta(seconds=lease_seconds)
-        stmt = (
-            select(RunModel.id)
-            .join(JobModel, JobModel.id == RunModel.job_id)
-            .where(
-                JobModel.status == JobStatus.ACTIVE,
-                self._run_ready_clause(now, lease_expiry),
-            )
-            .order_by(JobModel.priority.desc(), RunModel.id.asc())
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-        if queue:
-            stmt = stmt.where(JobModel.queue == queue)
-
-        with Session(self._engine) as session, session.begin():
-            row = session.execute(stmt).first()
-            if row is None:
-                return None
-            run_id = row[0]
-            session.execute(
-                update(RunModel)
-                .where(RunModel.id == run_id)
-                .values(
-                    status=RunStatus.RUNNING,
-                    worker_id=worker_id,
-                    error=None,
-                    started_at=case(
-                        (RunModel.started_at.is_(None), now), else_=RunModel.started_at
-                    ),
-                    locked_at=now,
-                    updated_at=now,
-                )
-            )
-            model = session.get(RunModel, run_id)
-            if model is None:
-                return None
-            return RunRecord.from_model(model)
-
-
-def backend_from_url(url: str, **engine_kwargs: Any) -> SQLAlchemyBackend:
-    """Build the right backend for a SQLAlchemy URL.
-
-    Configures sensible engine defaults (``pool_pre_ping``, and
-    ``check_same_thread=False`` for SQLite so runs can execute on worker
-    threads) and returns a :class:`SQLiteBackend` or :class:`PostgresBackend`.
-    """
-    from sqlalchemy import create_engine
-
-    options: dict[str, Any] = {"pool_pre_ping": True}
-    options.update(engine_kwargs)
-    if url.startswith("sqlite"):
-        connect_args = dict(options.get("connect_args") or {})
-        connect_args.setdefault("check_same_thread", False)
-        options["connect_args"] = connect_args
-    engine = create_engine(url, **options)
-    if engine.dialect.name == "postgresql":
-        return PostgresBackend(engine)
-    return SQLiteBackend(engine)

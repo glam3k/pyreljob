@@ -19,7 +19,7 @@ from typing import ClassVar
 import pytest
 
 from pyreljob import Job, JobManager, RunStatus, Task, TaskContext, TaskStatus
-from pyreljob.core.worker import Worker
+from pyreljob.worker import Worker
 
 PG_URL = os.environ.get("TEST_DATABASE_URL")
 
@@ -71,10 +71,8 @@ def manager():
 
 
 def test_backend_selection():
-    from pyreljob.backends.sqlalchemy_backend import (
-        PostgresBackend,
-        backend_from_url,
-    )
+    from pyreljob.backends import backend_from_url
+    from pyreljob.backends.postgres import PostgresBackend
 
     assert isinstance(backend_from_url(PG_URL), PostgresBackend)
 

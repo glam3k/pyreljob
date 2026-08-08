@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from pyreljob.core.job import JobRecord, RunRecord, TaskRecord
+from pyreljob.job import JobRecord, RunRecord, TaskRecord
 
 
 class Backend(ABC):
@@ -40,17 +40,16 @@ class Backend(ABC):
         self,
         job: str,
         args: Any = None,
-        cron: str | None = None,
         *,
         queue: str = "default",
         max_attempts: int = 3,
         retries: int = 0,
         next_run_at: datetime | None = None,
     ) -> JobRecord:
-        """Register a maintained job. Idempotent on (job class, cron).
+        """Register a maintained job. Idempotent on job class.
 
-        The job fires a new run each time ``next_run_at`` comes due. ``cron``
-        may be None for self-scheduling jobs that re-arm via ``Job.next_runtime``.
+        The job fires a new run each time ``next_run_at`` comes due; the
+        worker re-arms it after each run via ``Job.next_runtime``.
         """
 
     @abstractmethod
@@ -76,7 +75,7 @@ class Backend(ABC):
     def delete_job(self, job_id: int) -> None:
         """Hard-delete a job and all its runs and tasks.
 
-        Raises ValueError if the job has a pending or running run.
+        Raises ValueError if the job has a ready or running run.
         """
 
     @abstractmethod
@@ -92,9 +91,9 @@ class Backend(ABC):
     def claim_scheduled(self, job_id: int, next_run_at: datetime | None) -> bool:
         """Atomically claim a due maintained job and re-arm it.
 
-        ``next_run_at`` is what the beat sets back (the next cron occurrence,
-        or None for self-scheduling jobs awaiting worker reschedule). Returns
-        True if this caller won the race and should fire it.
+        ``next_run_at`` is what the beat sets back (``None``: fire now; the
+        worker re-arms after the run). Returns True if this caller won the
+        race and should fire it.
         """
 
     @abstractmethod
@@ -148,6 +147,10 @@ class Backend(ABC):
     @abstractmethod
     def set_run_ctx(self, run_id: int, ctx: dict[str, Any] | None) -> None:
         """Persist the shared TaskContext between tasks (resumability)."""
+
+    @abstractmethod
+    def set_run_progress(self, run_id: int, progress: float | None) -> None:
+        """Persist a run's progress (a float in [0, 1], or None to clear it)."""
 
     @abstractmethod
     def get_run(self, run_id: int) -> RunRecord | None: ...

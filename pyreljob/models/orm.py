@@ -9,7 +9,7 @@ runner.
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, String, Text, func
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -29,7 +29,6 @@ class JobModel(Base):
     args: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(16), default="on_demand")
-    cron: Mapped[str | None] = mapped_column(String(128), nullable=True)
     next_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
@@ -52,11 +51,12 @@ class RunModel(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[int] = mapped_column(Integer, index=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    status: Mapped[str] = mapped_column(String(16), default="ready", index=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     ctx: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    progress: Mapped[float | None] = mapped_column(Float, nullable=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
@@ -78,7 +78,7 @@ class TaskModel(Base):
     run_id: Mapped[int] = mapped_column(Integer, index=True)
     position: Mapped[int] = mapped_column(Integer)
     task_name: Mapped[str] = mapped_column(String(255))
-    status: Mapped[str] = mapped_column(String(16), default="pending")
+    status: Mapped[str] = mapped_column(String(16), default="ready")
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)

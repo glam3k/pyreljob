@@ -19,7 +19,7 @@ See [`DESIGN.md`](DESIGN.md) for the full architecture and semantics.
 - **Framework-level retries** — every task is retried up to the job's `max_attempts` (backoff + jitter); completed tasks never re-run
 - **Resumable** — task state is durable; a worker crash resumes at the next unfinished task
 - **Compensation** — when a task exhausts its retries, completed tasks are undone in reverse order
-- **On-demand & maintained** — one-off jobs, or cron-scheduled jobs that fire a new run per schedule
+- **On-demand & maintained** — one-off jobs, or periodic jobs that fire a new run per schedule
 - **Cooperative cancellation** — cancel a job; its run aborts at the next `check_cancelled()`
 - **Idempotency keys** — dedupe re-enqueues (protects the at-least-once guarantee)
 - **Task timeouts** — a task that exceeds its `timeout` is failed and retried/compensated
@@ -74,8 +74,8 @@ point that runs in any process that has your code installed:
 
 ```python
 # worker.py
-from pyreljob.backends.sqlalchemy_backend import backend_from_url
-from pyreljob.core.worker import Worker
+from pyreljob.backends import backend_from_url
+from pyreljob.worker import Worker
 
 Worker(backend_from_url("sqlite:///jobs.db"), max_concurrency=10).run_forever()
 ```
@@ -136,8 +136,8 @@ manager.enqueue(Notification("x@y.z"))
 **4. Run a worker** — any process that can import your job code:
 
 ```python
-from pyreljob.backends.sqlalchemy_backend import backend_from_url
-from pyreljob.core.worker import Worker
+from pyreljob.backends import backend_from_url
+from pyreljob.worker import Worker
 
 Worker(backend_from_url("sqlite:///jobs.db"), max_concurrency=10).run_forever()
 ```
@@ -185,7 +185,26 @@ manager.enqueue(Billing("u-1"), priority=100)   # bump just this run
 ```
 
 Priority is a property of the job (and each run it creates) — it is not part
-of a cron schedule.
+of its schedule.
+
+## Progress
+
+Every run carries a nullable `progress` float in `[0, 1]` — visible on
+`RunRecord.progress` via `manager.runs(job_id)` / `manager.get_run(run_id)`.
+`None` means "not reported." The framework never writes progress itself; it
+only provides the persistence channel — **tasks own progress entirely**, via
+`ctx.set_progress`. Each call is a small DB write, so report on meaningful
+milestones, not per item in a loop:
+
+```python
+class Backup(Task):
+    async def run(self, ctx: TaskContext) -> str:
+        files = list_files()
+        for i, f in enumerate(files):
+            await upload(f)
+            await ctx.set_progress((i + 1) / len(files))
+        return "done"
+```
 
 ## Composing jobs from tasks
 
@@ -225,44 +244,40 @@ manager.undo(job_id)
 
 ## Maintained (periodic) jobs
 
-### Fixed schedule (cron)
-
-```python
-manager.schedule(Notification("daily@x.yz"), "0 2 * * *")
-manager.run_forever()   # the beat fires due cron runs
-```
-
-### Self-scheduling (`Job.next_runtime`)
-
 Every job owns how often it runs. Override `next_runtime(last_run, ctx)` to
 compute the next run from when the previous run started, how long it took, its
-result, or business logic — then register the job without a cron:
+result, or business logic:
 
 ```python
 from datetime import datetime, timedelta
 from pyreljob import Job, JobManager, Task, TaskContext
-from pyreljob.core.job import RunRecord
+from pyreljob.job import RunRecord
 
 @dataclass
 class Poller(Job):
     tasks: ClassVar = [Fetch]
 
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
-        return last_run.finished_at + timedelta(minutes=5)   # 5 min after it finished
+        if last_run is None:
+            return datetime.now()                       # first fire: run now
+        return last_run.finished_at + timedelta(minutes=5)  # then 5 min after each finish
 ```
 
 ```python
 manager.schedule(Poller())     # fires now, then re-arms itself every run
+manager.run_forever()          # the beat fires each maintained job when due
 ```
 
-The worker calls `next_runtime` after each run finishes and re-arms the job;
-return `None` to stop. The base implementation uses `cron` (a class
-attribute) if set, otherwise the job runs once. Note that completion-based
-scheduling is serial — the next run only fires after the previous one
-finishes, so a slow run shifts the cadence.
+The framework calls `next_runtime(None, ctx)` to compute the first
+`next_run_at`: a returned `datetime` schedules the first run at that time,
+`None` fires it immediately. After each run finishes, the worker calls
+`next_runtime(run, ctx)` again to re-arm the schedule; return `None` from
+there to fire the next run right away. Completion-based scheduling is serial —
+the next run only fires after the previous one finishes, so a slow run shifts
+the cadence.
 
 A maintained job is one durable `jobs` row; every fire creates a fresh run.
-Misfire handling: a cron run overdue by more than `misfire_grace_seconds` is
+Misfire handling: a run overdue by more than `misfire_grace_seconds` is
 skipped (coalesced); runs missed while the scheduler was down are collapsed
 into one.
 
@@ -386,11 +401,13 @@ TEST_DATABASE_URL=postgresql+psycopg://pyreljob:pyreljob@localhost:5433/pyreljob
 
 ```
 pyreljob/
-├── backends/          # Backend ABC + SQLAlchemy backend (sqlite & postgres)
-├── core/              # records, JobManager API (client + beat), Worker
-├── migrations/        # versioned migration runner + schema steps (v1-v4)
-├── task.py            # user-facing Task/Job/TaskContext base classes
-└── signals.py         # graceful SIGINT/SIGTERM shutdown helpers
+├── manager.py        # JobManager API (client + beat)
+├── worker.py         # Worker executor
+├── backends/         # Backend ABC + SQLAlchemy impl; sqlite & postgres dialects
+├── models/           # SQLAlchemy ORM models mirroring the current schema
+├── migrations/       # versioned migration runner + schema steps (v1-v9)
+├── job.py            # records (JobRecord/RunRecord/TaskRecord) + statuses
+└── task.py           # user-facing Task/Job/TaskContext base classes
 ```
 
 The database — not `create_all` — is the source of truth: all schema changes go

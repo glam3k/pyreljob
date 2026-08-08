@@ -1,7 +1,7 @@
 """FastAPI example showing worker/manager with clean shutdown.
 
 This example demonstrates the PROPER way to run pyreljob within a FastAPI
-server - WITHOUT using signals.py or any signal handlers.
+server - WITHOUT registering signal handlers itself.
 
 The key insight: FastAPI handles shutdown internally, so we don't need
 signal handlers. This avoids the signal registration conflicts when worker
@@ -24,15 +24,14 @@ Docker setup for PostgreSQL:
 
 import asyncio
 import os
-from dataclasses import dataclass
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import ClassVar
 
 from fastapi import FastAPI
 
-from pyreljob import Job, Task, TaskContext
-from pyreljob import JobManager
-from pyreljob.core.worker import Worker
+from pyreljob import Job, JobManager, Task, TaskContext
+from pyreljob.worker import Worker
 
 
 class ProcessData(Task):

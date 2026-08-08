@@ -4,7 +4,7 @@ Run it as a library::
 
     from examples.hello import HelloWorld
     from pyreljob import JobManager
-    from pyreljob.core.worker import Worker
+    from pyreljob.worker import Worker
 
     manager = JobManager("sqlite:///hello.db")
     manager.migrate()
@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from pyreljob import Job, Task, TaskContext
-from pyreljob.core.worker import Worker
+from pyreljob.worker import Worker
 
 
 class SayHello(Task):
@@ -73,6 +73,6 @@ if __name__ == "__main__":
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda s, f: shutdown_handler())
 
-    print("Starting worker (PID: {})".format(os.getpid()))
+    print(f"Starting worker (PID: {os.getpid()})")
     print("Press Ctrl+C to shut down gracefully")
     worker.run_forever()

@@ -28,9 +28,9 @@ from pyreljob import (
     TaskContext,
     TaskStatus,
 )
-from pyreljob.core.job import JobRecord, RunRecord
-from pyreljob.core.worker import Worker
-from pyreljob.orm import JobModel, RunModel
+from pyreljob.job import JobRecord, RunRecord
+from pyreljob.models.orm import JobModel, RunModel
+from pyreljob.worker import Worker
 
 _release = threading.Event()
 UNDONE: list[str] = []
@@ -100,6 +100,29 @@ class SlowTask(Task):
 @dataclass
 class SlowJob(Job):
     tasks: ClassVar = [SlowTask]
+
+
+class ReportProgress(Task):
+    async def run(self, ctx: TaskContext) -> str:
+        await ctx.set_progress(0.5)
+        return "ok"
+
+
+@dataclass
+class ReportProgressJob(Job):
+    tasks: ClassVar = [ReportProgress]
+
+
+class LiveProgress(Task):
+    async def run(self, ctx: TaskContext) -> str:
+        await ctx.set_progress(0.4)
+        await asyncio.to_thread(_release.wait, 10)
+        return "ok"
+
+
+@dataclass
+class LiveProgressJob(Job):
+    tasks: ClassVar = [LiveProgress]
 
 
 class HangingTask(Task):
@@ -198,6 +221,8 @@ class Poller(Job):
     tasks: ClassVar = [Poll]
 
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
+        if last_run is None:
+            return datetime.now()  # first schedule: fire immediately
         return last_run.finished_at + timedelta(seconds=5)
 
 
@@ -326,7 +351,7 @@ def test_delete_job(manager):
 
 
 def test_delete_refuses_active_job(manager):
-    job = manager.enqueue(SlowJob())  # never run; still pending
+    job = manager.enqueue(SlowJob())  # never run; still ready
     with pytest.raises(ValueError):
         manager.delete(job.id)
     assert manager.get(job.id) is not None
@@ -402,10 +427,8 @@ def test_job_attempts_reset_on_success(manager):
 
 
 def test_backend_selection(tmp_path):
-    from pyreljob.backends.sqlalchemy_backend import (
-        SQLiteBackend,
-        backend_from_url,
-    )
+    from pyreljob.backends import backend_from_url
+    from pyreljob.backends.sqlite import SQLiteBackend
 
     backend = backend_from_url(f"sqlite:///{tmp_path}/jobs.db")
     assert isinstance(backend, SQLiteBackend)
@@ -438,7 +461,7 @@ def test_enqueue_creates_job_and_run(manager):
     runs = manager.runs(job.id)
     assert len(runs) == 1
     assert isinstance(runs[0], RunRecord)
-    assert runs[0].status == RunStatus.PENDING
+    assert runs[0].status == RunStatus.READY
 
 
 def test_enqueue_rejects_non_serializable(manager):
@@ -545,7 +568,7 @@ def test_worker_skips_delayed_run(manager):
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Sum), Sum)
     tick(worker)
-    assert manager.runs(job.id)[0].status == RunStatus.PENDING
+    assert manager.runs(job.id)[0].status == RunStatus.READY
 
 
 def test_worker_retries_task_with_job_max_attempts(manager):
@@ -555,7 +578,7 @@ def test_worker_retries_task_with_job_max_attempts(manager):
 
     tick(worker)
     run = manager.runs(job.id)[0]
-    assert run.status == RunStatus.PENDING
+    assert run.status == RunStatus.READY
     assert run.scheduled_at is not None
 
     make_due(manager.backend, run.id)
@@ -649,7 +672,7 @@ def test_cooperative_cancel(manager):
 
 
 def test_worker_resumes_after_crash(manager):
-    # Resumable1 succeeds, Resumable2 fails -> run pending; a fresh claim must
+    # Resumable1 succeeds, Resumable2 fails -> run ready; a fresh claim must
     # resume at Resumable2 (never re-running Resumable1).
     job = manager.enqueue(Resumable(), max_attempts=2)
     run = manager.runs(job.id)[0]
@@ -667,7 +690,7 @@ def test_worker_resumes_after_crash(manager):
     assert records[0].attempts == 1
     assert records[1].status == TaskStatus.SUCCEEDED
     assert records[1].attempts == 2
-    assert manager.runs(job.id)[0].status == RunStatus.PENDING
+    assert manager.runs(job.id)[0].status == RunStatus.READY
 
     make_due(manager.backend, run.id)
     tick(worker)  # AlwaysFails exhausts -> compensate -> failed
@@ -681,7 +704,7 @@ def test_worker_resumes_after_crash(manager):
 def test_worker_fails_when_class_cannot_resolve(manager, monkeypatch):
     job = manager.enqueue(Sum(1, 1))
     worker = Worker(manager.backend)
-    monkeypatch.setattr("pyreljob.core.worker.resolve_job", lambda name: None)
+    monkeypatch.setattr("pyreljob.worker.resolve_job", lambda name: None)
     tick(worker)
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.FAILED
@@ -705,14 +728,14 @@ def test_worker_resolves_class_by_dotted_path(manager, monkeypatch):
 
 
 def test_schedule_is_idempotent(manager):
-    a = manager.schedule(Saga(), "* * * * *")
-    b = manager.schedule(Saga(), "* * * * *")
+    a = manager.schedule(Poller())
+    b = manager.schedule(Poller())
     assert a.id == b.id
-    assert manager.runs(a.id) == []  # no run until the cron fires
+    assert manager.runs(a.id) == []  # no run until the beat fires it
 
 
 def test_beat_creates_run_for_maintained_job(manager):
-    job = manager.schedule(Saga(), "* * * * *")
+    job = manager.schedule(Poller())
 
     with manager.backend._engine.begin() as conn:
         conn.execute(
@@ -725,12 +748,14 @@ def test_beat_creates_run_for_maintained_job(manager):
     manager.tick()  # no double-fire
     runs = manager.runs(job.id)
     assert len(runs) == 1
-    assert runs[0].status == RunStatus.PENDING
-    assert manager.get(job.id).next_run_at is not None
+    assert runs[0].status == RunStatus.READY
+    # The fire disarmed the job; the worker re-arms it after the run.
+    assert manager.get(job.id).next_run_at is None
 
 
 def test_self_scheduling_job(manager):
-    # No cron: fires now, then re-arms itself via Job.next_runtime.
+    # First schedule fires now (next_runtime(None) => now), then the job
+    # re-arms itself via Job.next_runtime after each run.
     job = manager.schedule(Poller())
     manager.tick()
     assert len(manager.runs(job.id)) == 1
@@ -754,8 +779,20 @@ def test_self_scheduling_job(manager):
     assert len(manager.runs(job.id)) == 2
 
 
+def test_on_demand_job_is_not_rescheduled(manager):
+    job = manager.enqueue(Poller())
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(Poller), Poller)
+    tick(worker)
+    assert manager.runs(job.id)[0].status == RunStatus.SUCCEEDED
+    # On-demand jobs run once: the worker never re-arms next_run_at for them,
+    # even though Poller.next_runtime would schedule a future run.
+    assert manager.get(job.id).source == JobSource.ON_DEMAND
+    assert manager.get(job.id).next_run_at is None
+
+
 def test_beat_misfire_grace_skips_stale(manager):
-    job = manager.schedule(Saga(), "* * * * *")
+    job = manager.schedule(Poller())
     with manager.backend._engine.begin() as conn:
         conn.execute(
             update(JobModel)
@@ -767,7 +804,7 @@ def test_beat_misfire_grace_skips_stale(manager):
 
 
 def test_cancel_stops_future_scheduled_runs(manager):
-    job = manager.schedule(Saga(), "* * * * *")
+    job = manager.schedule(Poller())
     manager.cancel(job.id)
     assert manager.get(job.id).status == JobStatus.CANCELLED
     with manager.backend._engine.begin() as conn:
@@ -790,7 +827,7 @@ def test_idempotency_key_dedupes(manager):
 def test_counts_by_queue(manager):
     manager.enqueue(Sum(1, 1), queue="a")
     manager.enqueue(Sum(1, 1), queue="b")
-    assert manager.counts("a") == {"pending": 1}
+    assert manager.counts("a") == {"ready": 1}
 
 
 def test_claim_reclaims_expired_lease(manager):
@@ -842,7 +879,7 @@ def test_renew_lease(manager):
 
 
 def test_retry_backoff_uses_jitter(manager, monkeypatch):
-    import pyreljob.core.worker as worker_mod
+    import pyreljob.worker as worker_mod
 
     monkeypatch.setattr(worker_mod.random, "uniform", lambda a, b: 0.5)
 
@@ -852,9 +889,57 @@ def test_retry_backoff_uses_jitter(manager, monkeypatch):
     tick(worker)
 
     after = manager.runs(job.id)[0]
-    assert after.status == RunStatus.PENDING
+    assert after.status == RunStatus.READY
     expected = datetime.now() + timedelta(seconds=2**1 + 0.5)
     assert abs((after.scheduled_at - expected).total_seconds()) < 1.0
+
+
+def test_task_can_report_progress(manager):
+    job = manager.enqueue(ReportProgressJob())
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(ReportProgressJob), ReportProgressJob)
+    tick(worker)
+    run = manager.runs(job.id)[0]
+    assert run.status == RunStatus.SUCCEEDED
+    assert run.progress == 0.5
+
+
+def test_framework_does_not_set_progress(manager):
+    job = manager.enqueue(Sum(1, 1))  # tasks never call ctx.set_progress
+    worker = Worker(manager.backend)
+    worker.register(job_cls_path(Sum), Sum)
+    tick(worker)
+    run = manager.runs(job.id)[0]
+    assert run.status == RunStatus.SUCCEEDED
+    assert run.progress is None  # progress is owned by task code alone
+
+
+def test_progress_visible_live(manager):
+    _release.clear()
+    job = manager.enqueue(LiveProgressJob())
+    worker = Worker(manager.backend, poll_interval=0.05)
+    worker.register(job_cls_path(LiveProgressJob), LiveProgressJob)
+    thread = threading.Thread(target=worker.run_forever)
+    thread.start()
+    try:
+        deadline = time.time() + 10
+        run = manager.runs(job.id)[0]
+        while run.progress is None and time.time() < deadline:
+            time.sleep(0.02)
+            run = manager.runs(job.id)[0]
+        assert run.progress == 0.4
+    finally:
+        _release.set()
+        worker.stop()
+        thread.join(timeout=5)
+
+
+def test_set_progress_validates_range():
+    ctx = TaskContext(0, "app.Job")
+    with pytest.raises(ValueError):
+        asyncio.run(ctx.set_progress(1.5))
+    with pytest.raises(ValueError):
+        asyncio.run(ctx.set_progress(-0.1))
 
 
 def test_migration_upgrades_legacy_v1_schema(tmp_path):
@@ -883,16 +968,23 @@ def test_migration_upgrades_legacy_v1_schema(tmp_path):
         "job entities, runs, tasks",
         "add created_at/updated_at timestamps",
         "add job-level retries",
+        "drop cron column",
+        "rename pending runs/tasks to ready",
+        "add run progress column",
     ]
 
     with manager.backend._engine.connect() as conn:
-        jobs = conn.execute(text("SELECT job, source, cron, status FROM jobs")).all()
+        jobs = conn.execute(text("SELECT job, source, status FROM jobs")).all()
         assert jobs == [
-            ("app.Old", "scheduled", "0 2 * * *", "active"),
-            ("app.OneOff", "on_demand", None, "active"),
+            ("app.Old", "scheduled", "active"),
+            ("app.OneOff", "on_demand", "active"),
         ]
         runs = conn.execute(text("SELECT job_id, status FROM runs")).all()
-        assert runs == [(1, "pending"), (2, "succeeded")]
+        assert runs == [(1, "ready"), (2, "succeeded")]
         columns = {c["name"] for c in __import__("sqlalchemy").inspect(conn).get_columns("jobs")}
-        assert {"job", "args", "source", "cron", "idempotency_key", "next_run_at"} <= columns
-        assert not {"name", "payload", "schedule", "worker_id", "locked_at"} & columns
+        assert {"job", "args", "source", "idempotency_key", "next_run_at"} <= columns
+        assert not {"name", "payload", "schedule", "cron", "worker_id", "locked_at"} & columns
+        run_columns = {
+            c["name"] for c in __import__("sqlalchemy").inspect(conn).get_columns("runs")
+        }
+        assert "progress" in run_columns

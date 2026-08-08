@@ -2,7 +2,7 @@
 
 A Job is a durable entity (one-off or maintained). Each invocation of it is a
 Run. ``JobManager`` is both the client API (enqueue/schedule/cancel/query) and
-the beat (``run_forever()`` fires due cron, creating a run per maintained
+the beat (``run_forever()`` fires due maintained jobs, creating a run per
 job). It wraps a backend (a SQL database) and is the single public entry point
 — the ``Worker`` is the separate executor.
 """
@@ -13,11 +13,9 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from croniter import croniter
-
+from pyreljob.backends import backend_from_url
 from pyreljob.backends.base import Backend
-from pyreljob.backends.sqlalchemy_backend import backend_from_url
-from pyreljob.core.job import JobRecord, RunRecord, TaskRecord, TaskStatus
+from pyreljob.job import JobRecord, RunRecord, TaskRecord, TaskStatus
 from pyreljob.task import (
     Job,
     TaskContext,
@@ -100,7 +98,6 @@ class JobManager:
     def schedule(
         self,
         job: Job,
-        cron: str | None = None,
         *,
         queue: str | None = None,
         max_attempts: int = 3,
@@ -108,22 +105,18 @@ class JobManager:
     ) -> JobRecord:
         """Register a maintained job.
 
-        ``cron`` sets a fixed wall-clock schedule (e.g. ``"0 2 * * *"``);
-        pass ``None`` to register a self-scheduling job whose
-        :meth:`Job.next_runtime` re-arms its own cadence. Idempotent on
-        (job class, cron): re-registering reuses the existing job.
+        The job's :meth:`Job.next_runtime` controls the cadence: the framework
+        calls ``next_runtime(None, ctx)`` for the first schedule — a returned
+        datetime is when the first run fires, ``None`` fires it immediately.
+        After each run the worker calls ``next_runtime(run, ctx)`` again to
+        re-arm. Idempotent on job class: re-registering reuses the existing
+        job.
         """
         validate_job(job)
-        cron = cron or job.cron
-        if cron:
-            next_run = croniter(cron, datetime.now()).get_next(datetime)
-        else:
-            # Self-scheduling: fire the first run now; the job re-arms itself.
-            next_run = datetime.now()
+        next_run = job.next_runtime(None, TaskContext(0, job_name(job)))
         return self._backend.schedule(
             job_name(job),
             job.as_dict(),
-            cron,
             queue=queue or job.queue,
             max_attempts=max_attempts,
             retries=retries,
@@ -140,7 +133,7 @@ class JobManager:
     def delete(self, job_id: int) -> None:
         """Hard-delete a job and all its runs and tasks.
 
-        Raises ValueError if the job has a pending or running run — cancel it
+        Raises ValueError if the job has a ready or running run — cancel it
         first.
         """
         self._backend.delete_job(job_id)
@@ -204,9 +197,9 @@ class JobManager:
         poll_interval: float = 15.0,
         misfire_grace_seconds: int | None = None,
     ) -> None:
-        """Run the beat loop: fire due cron jobs until interrupted.
+        """Run the beat loop: fire due maintained jobs until interrupted.
 
-        Durable runs are created for each maintained job as its cron comes
+        Durable runs are created for each maintained job as its schedule comes
         due.
         """
 
@@ -214,7 +207,7 @@ class JobManager:
         import threading
 
         if threading.current_thread() is threading.main_thread():
-            def handle_signal():
+            def handle_signal() -> None:
                 self.stop()
 
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -244,10 +237,9 @@ class JobManager:
         """Find due maintained jobs and create a run for each.
 
         Coalesces missed runs into a single fire. If ``misfire_grace_seconds``
-        is set and a cron run is overdue by more than that, it is skipped
-        (self-scheduling jobs always fire when due). Each fire leaves the job
-        re-armed: cron jobs advance to the next occurrence, self-scheduling
-        jobs wait for the worker to re-arm via ``Job.next_runtime``.
+        is set and a run is overdue by more than that, it is skipped. Each
+        fire disarms the job (``next_run_at`` is cleared); the worker re-arms
+        it after the run via ``Job.next_runtime``.
         """
         grace = (
             misfire_grace_seconds
@@ -260,26 +252,19 @@ class JobManager:
             now = datetime.now()
             if job.next_run_at is not None and job.next_run_at > now:
                 continue
-            # Claim (re-arm next_run_at) first so concurrent beats never
+            # Claim (clear next_run_at) first so concurrent beats never
             # double-fire; the loser's conditional update fails.
-            fired = self._backend.claim_scheduled(job.id, self._next_occurrence(job, now))
+            fired = self._backend.claim_scheduled(job.id, None)
             if not fired:
                 continue
-            if job.cron and self._is_misfired(job.next_run_at, now, grace):
+            if self._is_misfired(job.next_run_at, now, grace):
                 logger.warning(
-                    "scheduled %s (%s) misfired and was skipped",
-                    job.job, job.cron,
+                    "scheduled %s misfired and was skipped",
+                    job.job,
                 )
                 continue
             logger.info("scheduled %s fired", job.job)
             self._backend.create_run(job.id)
-
-    @staticmethod
-    def _next_occurrence(job: JobRecord, now: datetime) -> datetime | None:
-        if job.cron:
-            result = croniter(job.cron, now).get_next(datetime)
-            return result if isinstance(result, datetime) else None
-        return None  # self-scheduling: worker re-arms after the run
 
     @staticmethod
     def _is_misfired(

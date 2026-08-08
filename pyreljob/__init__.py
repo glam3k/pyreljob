@@ -3,7 +3,7 @@
 Backed by SQLite or PostgreSQL. Ships with a built-in migration framework.
 """
 
-from pyreljob.core.job import (
+from pyreljob.job import (
     JobRecord,
     JobSource,
     JobStatus,
@@ -12,7 +12,7 @@ from pyreljob.core.job import (
     TaskRecord,
     TaskStatus,
 )
-from pyreljob.core.manager import JobManager
+from pyreljob.manager import JobManager
 from pyreljob.task import (
     Job,
     JobCancelledError,

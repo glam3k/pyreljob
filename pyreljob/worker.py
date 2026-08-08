@@ -26,7 +26,14 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from pyreljob.backends.base import Backend
-from pyreljob.core.job import JobRecord, JobStatus, RunRecord, TaskRecord, TaskStatus
+from pyreljob.job import (
+    JobRecord,
+    JobSource,
+    JobStatus,
+    RunRecord,
+    TaskRecord,
+    TaskStatus,
+)
 from pyreljob.task import (
     Job,
     JobCancelledError,
@@ -84,7 +91,7 @@ class Worker:
         import threading
 
         if threading.current_thread() is threading.main_thread():
-            def handle_signal():
+            def handle_signal() -> None:
                 self.stop()
 
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -268,9 +275,15 @@ class Worker:
         run_id: int,
         ctx: TaskContext,
     ) -> None:
-        """Ask the job when it should run next and re-arm the schedule."""
+        """Ask a maintained job when it should run next and re-arm the schedule.
+
+        On-demand jobs run once — their runs are created by ``enqueue`` and
+        picked up directly by the worker, so they are never re-armed.
+        """
+        if job.source != JobSource.SCHEDULED or job.id is None:
+            return
         run = await asyncio.to_thread(self._backend.get_run, run_id)
-        if run is None or job.id is None:
+        if run is None:
             return
         instance = job_cls.from_dict(job.args or {})
         next_runtime = instance.next_runtime(run, ctx)
@@ -373,6 +386,12 @@ class Worker:
             else TaskContext(job_id=run.job_id, job=job.job, args=job.args or {})
         )
         ctx.job_id = run.job_id
+        ctx.progress = run.progress
+        assert run.id is not None
+        run_id = run.id
+        ctx._progress_hook = lambda value: asyncio.to_thread(
+            self._backend.set_run_progress, run_id, value
+        )
         return ctx
 
     def _backoff(self, attempts: int) -> float:

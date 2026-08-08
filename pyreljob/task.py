@@ -38,13 +38,12 @@ from __future__ import annotations
 
 import importlib
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from typing import Any, ClassVar
 
-from croniter import croniter
-
-from pyreljob.core.job import RunRecord, TaskRecord
+from pyreljob.job import RunRecord, TaskRecord
 
 
 class JobCancelledError(Exception):
@@ -60,6 +59,8 @@ class TaskContext:
         args: the job's serialized constructor arguments.
         results: per-task results, keyed by task class name.
         state: arbitrary task-shared mutable state (persisted between tasks).
+        progress: the run's current progress (a float in [0, 1]) — ``None``
+            until reported.
         cancelled: cooperative cancellation flag (set by the worker heartbeat).
     """
 
@@ -71,6 +72,8 @@ class TaskContext:
         results: dict[str, Any] | None = None,
         state: dict[str, Any] | None = None,
         cancelled: bool = False,
+        progress: float | None = None,
+        _progress_hook: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self.job_id = job_id
         self.job = job
@@ -78,6 +81,22 @@ class TaskContext:
         self.results = results or {}
         self.state = state or {}
         self.cancelled = cancelled
+        self.progress = progress
+        self._progress_hook = _progress_hook
+
+    async def set_progress(self, progress: float) -> None:
+        """Report the run's progress — a float in [0, 1].
+
+        Persists immediately (a small DB write), so call it sparingly — e.g.
+        on meaningful milestones rather than per item in a tight loop. When the
+        run is processed by a framework worker, the stored value is also
+        reflected on the ``progress`` attribute and in ``RunRecord.progress``.
+        """
+        if progress < 0 or progress > 1:
+            raise ValueError(f"progress must be between 0 and 1, got {progress!r}")
+        self.progress = progress
+        if self._progress_hook is not None:
+            await self._progress_hook(progress)
 
     def check_cancelled(self) -> None:
         """Abort cooperatively: raise :class:`JobCancelledError` if cancelled."""
@@ -153,36 +172,30 @@ class Job(ABC):
     custom parameter handling can be plain classes that override
     :meth:`as_dict` and :meth:`from_dict`.
 
-    A job also owns its schedule: set ``cron`` for a fixed wall-clock
-    schedule, or override :meth:`next_runtime` to self-schedule based on when
-    each run started, how long it took, its result, or business logic.
+    A job also owns its schedule: override :meth:`next_runtime` to say when
+    the next run should fire, based on when each run started, how long it
+    took, its result, or business logic.
     """
 
     tasks: ClassVar[list[type[Task]]] = []
     queue: ClassVar[str] = "default"
     priority: ClassVar[int] = 0
-    #: Optional fixed cron schedule, e.g. ``"0 2 * * *"``. Used by the base
-    #: :meth:`next_runtime`; ``None`` means the job only runs when enqueued or
-    #: when an overridden :meth:`next_runtime` re-arms it.
-    cron: ClassVar[str | None] = None
 
     def next_runtime(
         self,
-        last_run: RunRecord,
+        last_run: RunRecord | None,
         ctx: TaskContext,
     ) -> datetime | None:
         """When should this job run next?
 
-        Called after a run finishes. The base implementation returns the next
-        cron tick after the run finished (if ``cron`` is set), otherwise
-        ``None`` (run once). Override to self-schedule — e.g. from
-        ``last_run.started_at`` / ``finished_at`` (duration), the run's
-        ``result``, or business logic in ``ctx``. Return ``None`` to stop.
+        Called by the framework to compute the first ``next_run_at``
+        (``last_run`` is ``None``), and by the worker after a run finishes to
+        re-arm the schedule. Return a ``datetime`` to schedule the next run,
+        or ``None`` to fire immediately (the beat runs it as soon as it is
+        due). Override to self-schedule — e.g. from ``last_run.started_at`` /
+        ``finished_at`` (duration), the run's ``result``, or business logic
+        in ``ctx``.
         """
-        if self.cron:
-            base = last_run.finished_at or datetime.now()
-            result = croniter(self.cron, base).get_next(datetime)
-            return result if isinstance(result, datetime) else None
         return None
 
     def as_dict(self) -> dict[str, Any]:

@@ -17,9 +17,10 @@ The model follows the workflow-engine convention of **durable entity vs. run**
 | **Run** | One invocation of a job — the ordered execution of its tasks. No class; just a record. | `runs` row (one per run) |
 
 A **Job** is the thing you reference over time: it owns the input (`args`),
-the retry policy, the idempotency key, and — for maintained jobs — the cron
-schedule. Every time the job executes, that execution is a **Run**. There is no
-separate "chain" abstraction: the ordered task list lives on the Job itself.
+the retry policy, the idempotency key, and — for maintained jobs — its
+schedule (via `next_runtime`). Every time the job executes, that execution is
+a **Run**. There is no separate "chain" abstraction: the ordered task list
+lives on the Job itself.
 
 ## Abstractions
 
@@ -58,10 +59,11 @@ class Job(ABC):
 ```
 jobs   entities:   id, job (dotted class), args, queue, priority,
                    status(active|cancelled), source(on_demand|scheduled),
-                   cron, next_run_at, max_attempts, idempotency_key (unique),
+                   next_run_at, max_attempts, idempotency_key (unique),
                    created_at
-runs   invocations: id, job_id, status(pending|running|succeeded|failed|
-                   cancelled), result, error, ctx, worker_id, scheduled_at,
+runs   invocations: id, job_id, status(ready|running|succeeded|failed|
+                   cancelled), result, error, ctx, worker_id,
+                   progress (float 0..1, nullable), scheduled_at,
                    created_at, started_at, finished_at, locked_at (lease)
 tasks  task execs:  id, run_id, position, task_name, status, result, error,
                    attempts, retry_at, started_at, finished_at, compensated_at
@@ -74,8 +76,8 @@ manager = JobManager("sqlite:///jobs.db")      # or postgresql://...
 manager.migrate()
 job = manager.enqueue(Booking("u-1", 99), idempotency_key="booking-u1")
 job = manager.enqueue(Booking("u-1", 99), max_attempts=5)   # retry count per task
-manager.schedule(Booking("u-1", 99), "0 2 * * *")           # maintained job
-manager.run_forever()               # beat: fire due cron (same manager)
+manager.schedule(Booking("u-1", 99))                 # maintained job
+manager.run_forever()               # beat: fire due maintained jobs (same manager)
 manager.cancel(job_id)      # stop only, no compensation
 manager.undo(job_id)        # manual saga: reverse-compensate a run's tasks
 manager.runs(job_id)        # the job's invocations, newest first
@@ -96,11 +98,11 @@ Producers (your app) ── JobManager: enqueue / schedule / cancel / query
                             Database        ← the only shared state
                                  ▲
 Workers (N processes) ──────────┘   claim + lease + execute tasks
-Manager beat ───────────────────►   run_forever() fires cron → creates runs
+Manager beat ───────────────────►   run_forever() fires due maintained jobs → creates runs
 ```
 
 - **`JobManager`** — the control plane: client API *and* the beat loop
-  (`run_forever()` fires due cron). Used by producer processes and, in beat
+  (`run_forever()` fires due maintained jobs). Used by producer processes and, in beat
   mode, as a long-running process.
 - **`Worker`** — the executor: claims runs with a lease, heartbeats, executes
   the job's tasks. N processes scale horizontally.
@@ -132,14 +134,14 @@ Manager beat ───────────────────►   run_
   at its next `check_cancelled()`.
 - **Maintained jobs**: `schedule()` registers one `jobs` row. The manager beat
   (`run_forever()`/`tick()`) fires when a job's `next_run_at` is due,
-  atomically re-arming it (concurrent beats never double-fire). Every fire
-  creates a fresh run of the job. Misfire grace applies to cron jobs.
+  atomically clearing it (concurrent beats never double-fire). Every fire
+  creates a fresh run of the job. Misfire grace applies to overdue runs.
 - **Self-scheduling**: every job owns its cadence via
-  `Job.next_runtime(last_run, ctx)`. The worker calls it after each run
-  finishes and re-arms `next_run_at`, so a job can schedule its next run from
-  when the run started, how long it took, its result, or business logic.
-  Return `None` to stop. The base implementation uses the `cron` class
-  attribute (next tick after the run finished) or `None` (run once).
+  `Job.next_runtime(last_run, ctx)`. The framework calls it with `last_run=None`
+  to compute the first `next_run_at` (a returned `datetime` schedules the first
+  run; `None` fires immediately). The worker calls it after each run finishes
+  and re-arms `next_run_at`, so a job can schedule its next run from when the
+  run started, how long it took, its result, or business logic.
   Completion-based scheduling is serial — the next run fires only after the
   previous one finishes.
 
@@ -165,8 +167,8 @@ state and every transition is an atomic conditional UPDATE:
 - **Manager — client**: `enqueue`/`schedule`/`cancel`/`undo` are idempotent
   (idempotency keys dedupe; `schedule`/`cancel` are conditional), so any number
   of app processes can call them concurrently.
-- **Manager — beat (N replicas)**: `claim_scheduled()` atomically advances
-  `next_run_at`, so only one beat wins each cron fire — no double-firing.
+- **Manager — beat (N replicas)**: `claim_scheduled()` atomically clears
+  `next_run_at`, so only one beat wins each fire — no double-firing.
 
 ## Deployment
 

@@ -14,21 +14,20 @@ This refactoring removes cron-based scheduling and uses only the `next_runtime` 
 - Jobs now have full control over their scheduling logic
 
 ### 2. JobManager (manager.py)
-- Removed: `schedule()` method (no longer needed)
+- Removed: `cron` parameter from `schedule()`
 - Removed: `_next_occurrence()` method
-- Removed: `_is_misfired()` method
 - Removed: `croniter` import
-- Simplified: `run_forever()` just calls `tick()` periodically
-- Maintains: `schedule()` method is no longer needed because `enqueue()` can set `next_run_at`
+- Simplified: `schedule(job)` computes the first `next_run_at` via `next_runtime(None, ctx)` — a returned datetime schedules the first run at that time, `None` fires it immediately
+- Simplified: `tick()` claims each due job (clears `next_run_at`) and the worker re-arms it via `next_runtime(run, ctx)` after the run
+- Maintains: `enqueue(job)` for one-off jobs (run now), `schedule(job)` for maintained jobs (driven by `next_run_at`)
 
 ### 3. Backend Interface (backends/base.py)
 - Removed: `cron` parameter from `schedule()` method
-- Removed: `schedule()` method entirely
 - Kept: `claim_scheduled()` and `set_next_run_at()` for maintaining jobs
 
 ### 4. Database Schema (orm.py, migrations/versions.py)
 - Removed: `cron` column from `jobs` table
-- Removed: All cron-related migration versions
+- Added: migration v7 ("drop cron column") — v4 keeps the legacy `schedule -> cron` backfill so old databases still migrate cleanly
 - Kept: `next_run_at` column for scheduling
 
 ### 5. Examples (examples/)
@@ -44,7 +43,7 @@ This refactoring removes cron-based scheduling and uses only the `next_runtime` 
 class DataImportJob(Job):
     file_path: str
     tasks: ClassVar = [ImportTask]
-    
+
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
         return None  # Run once, then stop
 ```
@@ -55,18 +54,18 @@ class DataImportJob(Job):
 class HeartbeatJob(Job):
     interval_minutes: int
     tasks: ClassVar = [HeartbeatTask]
-    
+
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
         if last_run is None:
             return datetime.now()  # Run immediately first time
-        return datetime.now() + timedelta(minutes=self.interval_minutes)
+        return last_run.finished_at + timedelta(minutes=self.interval_minutes)
 ```
 
 ### Pattern 3: Event-Driven Jobs
 ```python
 class EventProcessorJob(Job):
     tasks: ClassVar = [ProcessEventTask]
-    
+
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
         # Schedule next run based on business logic
         if some_event_occurred:
@@ -83,8 +82,11 @@ from examples.heartbeat import HeartbeatJob
 manager = JobManager("sqlite:///jobs.db")
 manager.migrate()
 
-# Enqueue with immediate first run
-job = manager.enqueue(HeartbeatJob(interval_minutes=5))
+# On-demand: runs now
+manager.enqueue(HeartbeatJob(interval_minutes=5))
+
+# Maintained: the beat fires it when next_run_at comes due
+manager.schedule(HeartbeatJob(interval_minutes=5))
 
 # Start the beat scheduler
 manager.run_forever()
@@ -109,8 +111,6 @@ examples/
 class ScheduledJob(Job):
     cron: ClassVar[str | None] = "0 2 * * *"  # Daily at 2 AM
     tasks: ClassVar = [SomeTask]
-    
-    # Uses croniter for scheduling
 ```
 
 #### New Pattern (next_runtime-based):
@@ -118,11 +118,11 @@ class ScheduledJob(Job):
 @dataclass
 class ScheduledJob(Job):
     tasks: ClassVar = [SomeTask]
-    
+
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
         if last_run is None:
             return datetime.now()
-        return datetime.now() + timedelta(days=1)  # Daily
+        return last_run.finished_at + timedelta(days=1)  # Daily
 ```
 
 ## Benefits
@@ -137,10 +137,9 @@ class ScheduledJob(Job):
 
 This refactoring introduces breaking changes:
 
-1. **Job class signature**: Removed `cron` parameter
-2. **Database schema**: `cron` column removed (may require migration)
-3. **API**: `JobManager.schedule()` method removed
-4. **Migration**: Existing databases need to be migrated
+1. **Job class signature**: Removed `cron` class attribute
+2. **Database schema**: `cron` column removed (migration v7)
+3. **API**: `JobManager.schedule()` no longer takes a `cron` argument
 
 ## Migration Steps
 
@@ -156,30 +155,31 @@ class MyJob(Job):
 @dataclass
 class MyJob(Job):
     tasks: ClassVar = [MyTask]
-    
+
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
         if last_run is None:
             return datetime.now()
-        return datetime.now() + timedelta(hours=1)
+        return last_run.finished_at + timedelta(hours=1)
 ```
 
 ### 2. Update Database
-Run migration script to remove cron column from jobs table.
+Run migrations (v7 drops the `cron` column from the `jobs` table).
 
 ### 3. Update JobManager Usage
 ```python
 # Before
-manager.schedule(MyJob, cron="0 * * * *")
+manager.schedule(MyJob(), cron="0 * * * *")
 
 # After
-manager.enqueue(MyJob())  # next_runtime decides when to run
+manager.schedule(MyJob())  # next_runtime(None, ctx) decides the first fire
 ```
 
 ## Testing
 
-All tests need to be updated:
+All cron-based tests were rewritten around `next_runtime` self-scheduling jobs:
+
 1. Replace cron-based tests with next_runtime tests
 2. Update fixture setup
-3. Verify database migrations
+3. Verify database migrations (legacy v1 schema now ends up without a `cron` column)
 
 This refactoring results in a much cleaner, more flexible framework while maintaining backward compatibility where possible.
