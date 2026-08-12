@@ -106,6 +106,7 @@ class JobManager:
         max_attempts: int = 3,
         retries: int = 0,
         tags: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> JobRecord:
         """Register a maintained job.
 
@@ -113,8 +114,12 @@ class JobManager:
         calls ``next_runtime(None, ctx)`` for the first schedule — a returned
         datetime is when the first run fires, ``None`` fires it immediately.
         After each run the worker calls ``next_runtime(run, ctx)`` again to
-        re-arm. Idempotent on job class: re-registering reuses the existing
-        job.
+        re-arm.
+
+        Idempotent per ``(job, idempotency_key)``: re-registering the same key
+        reuses the existing row; a different key creates a separate maintained
+        instance of the same job class. With no key, one row per job class is
+        kept (previous behavior).
         """
         validate_job(job)
         next_run = job.next_runtime(None, TaskContext(0, job_name(job)))
@@ -126,6 +131,7 @@ class JobManager:
             retries=retries,
             next_run_at=next_run,
             tags=tags,
+            idempotency_key=idempotency_key,
         )
 
     def cancel(self, job_id: int) -> None:

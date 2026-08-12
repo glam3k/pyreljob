@@ -799,6 +799,35 @@ def test_schedule_is_idempotent(manager):
     assert manager.runs(a.id) == []  # no run until the beat fires it
 
 
+def test_schedule_multiple_instances_by_key(manager):
+    a = manager.schedule(Poller(), idempotency_key="poller:1")
+    b = manager.schedule(Poller(), idempotency_key="poller:2")
+    assert a.id != b.id
+    # each instance runs independently
+    assert a.args is not None and b.args is not None
+
+
+def test_schedule_same_key_is_idempotent(manager):
+    a = manager.schedule(Poller(), idempotency_key="poller:1")
+    b = manager.schedule(Poller(), idempotency_key="poller:1")
+    assert a.id == b.id
+
+
+def test_schedule_keyed_and_keyless_are_distinct(manager):
+    keyed = manager.schedule(Poller(), idempotency_key="poller:1")
+    keyless = manager.schedule(Poller())
+    assert keyed.id != keyless.id
+
+
+def test_schedule_same_key_different_class_is_idempotent_per_class(manager):
+    # Same key on the same class stays idempotent; the global unique index on
+    # idempotency_key means a key must be unique across classes too, so callers
+    # should namespace keys by job (e.g. "job:instance").
+    a = manager.schedule(Poller(), idempotency_key="shared")
+    b = manager.schedule(Poller(), idempotency_key="shared")
+    assert a.id == b.id
+
+
 def test_beat_creates_run_for_maintained_job(manager):
     job = manager.schedule(Poller())
 

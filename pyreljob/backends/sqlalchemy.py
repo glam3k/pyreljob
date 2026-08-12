@@ -128,12 +128,14 @@ class SQLAlchemyBackend(Backend):
         retries: int = 0,
         next_run_at: datetime | None = None,
         tags: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> JobRecord:
         with Session(self._engine) as session:
             existing = session.execute(
                 select(JobModel).where(
                     JobModel.job == job,
                     JobModel.source == JobSource.SCHEDULED,
+                    self._key_matches(JobModel, idempotency_key),
                 )
             ).scalar_one_or_none()
             if existing is not None:
@@ -148,6 +150,7 @@ class SQLAlchemyBackend(Backend):
             retries=retries,
             next_run_at=next_run_at,
             tags=tags,
+            idempotency_key=idempotency_key,
             updated_at=datetime.now(),
         )
         with Session(self._engine) as session:
@@ -155,6 +158,12 @@ class SQLAlchemyBackend(Backend):
             session.commit()
             return JobRecord.from_model(model)
 
+    @staticmethod
+    def _key_matches(model: type[JobModel], key: str | None) -> Any:
+        """WHERE clause matching a job by idempotency key (NULL-aware)."""
+        if key is None:
+            return model.idempotency_key.is_(None)
+        return model.idempotency_key == key
     def get(self, job_id: int) -> JobRecord | None:
         with Session(self._engine) as session:
             model = session.get(JobModel, job_id)

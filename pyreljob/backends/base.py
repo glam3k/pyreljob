@@ -48,11 +48,14 @@ class Backend(ABC):
         retries: int = 0,
         next_run_at: datetime | None = None,
         tags: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> JobRecord:
-        """Register a maintained job. Idempotent on job class.
+        """Register a maintained job.
 
-        The job fires a new run each time ``next_run_at`` comes due; the
-        worker re-arms it after each run via ``Job.next_runtime``.
+        Idempotent per (job, idempotency_key): re-registering the same key
+        reuses the existing row, while a different key creates a separate
+        maintained instance of the same job class. With no key, one row per
+        job class is maintained.
         """
 
     @abstractmethod
