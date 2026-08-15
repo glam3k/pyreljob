@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import ClassVar
 
 import pytest
@@ -47,7 +47,7 @@ def make_due(backend, run_id: int) -> None:
         conn.execute(
             update(RunModel)
             .where(RunModel.id == run_id)
-            .values(scheduled_at=datetime.now() - timedelta(seconds=1))
+            .values(scheduled_at=datetime.now(timezone.utc) - timedelta(seconds=1))
         )
 
 
@@ -222,7 +222,7 @@ class Poller(Job):
 
     def next_runtime(self, last_run: RunRecord, ctx: TaskContext) -> datetime | None:
         if last_run is None:
-            return datetime.now()  # first schedule: fire immediately
+            return datetime.now(timezone.utc)  # first schedule: fire immediately
         return last_run.finished_at + timedelta(seconds=5)
 
 
@@ -368,7 +368,7 @@ def test_prune_removes_old_terminal_runs(manager):
         conn.execute(
             update(RunModel)
             .where(RunModel.id == old_run.id)
-            .values(finished_at=datetime.now() - timedelta(days=40))
+            .values(finished_at=datetime.now(timezone.utc) - timedelta(days=40))
         )
 
     recent_job = manager.enqueue(Sum(2, 2))
@@ -529,7 +529,7 @@ def test_list_runs_joins_owning_job(manager):
         conn.execute(
             update(JobModel)
             .where(JobModel.id == scheduled.id)
-            .values(next_run_at=datetime.now() - timedelta(seconds=1))
+            .values(next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1))
         )
     manager.tick()  # fire run 2
     runs = manager.list_runs(tag="user:9")
@@ -629,7 +629,7 @@ def test_worker_runs_tasks_in_order_with_shared_ctx(manager):
 
 
 def test_worker_skips_delayed_run(manager):
-    job = manager.enqueue(Sum(1, 1), scheduled_at=datetime.now() + timedelta(hours=1))
+    job = manager.enqueue(Sum(1, 1), scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1))
     worker = Worker(manager.backend)
     worker.register(job_cls_path(Sum), Sum)
     tick(worker)
@@ -835,7 +835,7 @@ def test_beat_creates_run_for_maintained_job(manager):
         conn.execute(
             update(JobModel)
             .where(JobModel.id == job.id)
-            .values(next_run_at=datetime.now() - timedelta(seconds=1))
+            .values(next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1))
         )
 
     manager.tick()
@@ -860,14 +860,14 @@ def test_self_scheduling_job(manager):
     run = manager.runs(job.id)[0]
     assert run.status == RunStatus.SUCCEEDED
     scheduled = manager.get(job.id).next_run_at
-    assert scheduled is not None and scheduled > datetime.now()
+    assert scheduled is not None and scheduled > datetime.now(timezone.utc)
 
     # Force the re-armed time due; the beat fires run 2.
     with manager.backend._engine.begin() as conn:
         conn.execute(
             update(JobModel)
             .where(JobModel.id == job.id)
-            .values(next_run_at=datetime.now() - timedelta(seconds=1))
+            .values(next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1))
         )
     manager.tick()
     assert len(manager.runs(job.id)) == 2
@@ -891,7 +891,7 @@ def test_beat_misfire_grace_skips_stale(manager):
         conn.execute(
             update(JobModel)
             .where(JobModel.id == job.id)
-            .values(next_run_at=datetime.now() - timedelta(hours=2))
+            .values(next_run_at=datetime.now(timezone.utc) - timedelta(hours=2))
         )
     manager.tick(misfire_grace_seconds=30)
     assert manager.runs(job.id) == []
@@ -905,7 +905,7 @@ def test_cancel_stops_future_scheduled_runs(manager):
         conn.execute(
             update(JobModel)
             .where(JobModel.id == job.id)
-            .values(next_run_at=datetime.now() - timedelta(seconds=1))
+            .values(next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1))
         )
     manager.tick()
     assert manager.runs(job.id) == []
@@ -942,7 +942,7 @@ def test_claim_reclaims_expired_lease(manager):
         conn.execute(
             update(RunModel)
             .where(RunModel.id == run.id)
-            .values(locked_at=datetime.now() - timedelta(seconds=5))
+            .values(locked_at=datetime.now(timezone.utc) - timedelta(seconds=5))
         )
 
     reclaimed = manager.backend.claim("worker-2", lease_seconds=1)
@@ -984,7 +984,7 @@ def test_retry_backoff_uses_jitter(manager, monkeypatch):
 
     after = manager.runs(job.id)[0]
     assert after.status == RunStatus.READY
-    expected = datetime.now() + timedelta(seconds=2**1 + 0.5)
+    expected = datetime.now(timezone.utc) + timedelta(seconds=2**1 + 0.5)
     assert abs((after.scheduled_at - expected).total_seconds()) < 1.0
 
 

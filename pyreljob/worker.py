@@ -22,7 +22,7 @@ import asyncio
 import logging
 import random
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pyreljob.backends.base import Backend
@@ -261,7 +261,7 @@ class Worker:
             return
         attempts = await asyncio.to_thread(self._backend.increment_job_attempts, job.id)
         if attempts <= job.retries:
-            retry_at = datetime.now() + timedelta(seconds=self._backoff(attempts))
+            retry_at = datetime.now(timezone.utc) + timedelta(seconds=self._backoff(attempts))
             await asyncio.to_thread(self._backend.create_run, job.id, scheduled_at=retry_at)
             logger.info(
                 "job %s: whole-run attempt %d/%d failed, retrying at %s",
@@ -326,11 +326,11 @@ class Worker:
                 await self._compensate(run_id, job_cls, ctx)
                 await self._finalize_failed(job, run_id, error)
                 return "failed"  # run finalized as failed; nothing more to run
-            retry_at = datetime.now() + timedelta(seconds=self._backoff(attempts))
+            retry_at = datetime.now(timezone.utc) + timedelta(seconds=self._backoff(attempts))
             logger.warning(
                 "run %s: task %s attempt %d/%d failed, retrying in %.1fs",
                 run_id, task_cls.__name__, attempts, max_attempts,
-                (retry_at - datetime.now()).total_seconds(),
+                (retry_at - datetime.now(timezone.utc)).total_seconds(),
             )
             await asyncio.to_thread(self._backend.set_run_ctx, run_id, ctx.as_dict())
             await asyncio.to_thread(

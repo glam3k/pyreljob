@@ -7,7 +7,7 @@ wake-up via LISTEN/NOTIFY) have a clean home here.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import case, select, update
 from sqlalchemy.orm import Session
@@ -31,8 +31,8 @@ class PostgresBackend(SQLAlchemyBackend):
         *,
         lease_seconds: int = 30,
     ) -> RunRecord | None:
-        now = datetime.now()
-        lease_expiry = datetime.now() - timedelta(seconds=lease_seconds)
+        now = datetime.now(timezone.utc)
+        lease_expiry = datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
         stmt = (
             select(RunModel.id)
             .join(JobModel, JobModel.id == RunModel.job_id)

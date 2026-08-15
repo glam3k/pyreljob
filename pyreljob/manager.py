@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from pyreljob.backends import backend_from_url
 from pyreljob.backends.base import Backend
@@ -152,7 +152,7 @@ class JobManager:
     def prune(self, older_than: timedelta) -> int:
         """Delete terminal runs (and their tasks) finished before
         ``now - older_than``. Returns the number of runs deleted."""
-        return self._backend.prune_runs(datetime.now() - older_than)
+        return self._backend.prune_runs(datetime.now(timezone.utc) - older_than)
 
     async def undo(self, job_id: int) -> None:
         """Manually compensate a job's most recent run (saga pattern).
@@ -276,7 +276,7 @@ class JobManager:
         for job in self._backend.list_scheduled():
             if job.id is None:
                 continue
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             if job.next_run_at is not None and job.next_run_at > now:
                 continue
             # Claim (clear next_run_at) first so concurrent beats never

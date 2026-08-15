@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import ClassVar
 
 import pytest
@@ -127,7 +127,7 @@ def test_worker_reclaims_expired_lease(manager):
     with manager.backend._engine.begin() as conn:
         conn.execute(
             text("UPDATE runs SET locked_at = :expired WHERE id = :id"),
-            {"expired": datetime.now() - timedelta(seconds=30), "id": run.id},
+            {"expired": datetime.now(timezone.utc) - timedelta(seconds=30), "id": run.id},
         )
 
     reclaimed = manager.backend.claim("worker-2", lease_seconds=5)

@@ -6,11 +6,47 @@ migrations in ``pyreljob.migrations.versions``. The database — not ``create_al
 runner.
 """
 
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, func
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, func, types
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class UTCDateTime(types.TypeDecorator[datetime]):
+    """Timezone-aware ``datetime`` that treats naive values as UTC.
+
+    Stored timestamps are UTC instants. Depending on the dialect/column the
+    driver may return naive datetimes (e.g. ``timestamp without time zone``
+    columns on PostgreSQL); this type attaches UTC so every value the ORM
+    reads or writes carries an explicit ``+00:00`` offset. This is what lets
+    API layers serialize timestamps with an offset and browsers display them
+    in local time.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Any) -> Any:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(self, value: datetime | None, dialect: Any) -> Any:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+def _utc_datetime_column(nullable: bool = False, **kwargs: Any) -> Any:
+    """A UTC-normalized ``datetime`` column using :class:`UTCDateTime`."""
+    return mapped_column(UTCDateTime, nullable=nullable, **kwargs)
 
 
 class Base(DeclarativeBase):
@@ -29,8 +65,8 @@ class JobModel(Base):
     args: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     source: Mapped[str] = mapped_column(String(16), default="on_demand")
-    next_run_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
+    next_run_at: Mapped[datetime | None] = _utc_datetime_column(
+        nullable=True, index=True
     )
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     retries: Mapped[int] = mapped_column(Integer, default=0)
@@ -39,10 +75,10 @@ class JobModel(Base):
         String(255), nullable=True, unique=True
     )
     tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+    created_at: Mapped[datetime] = _utc_datetime_column(
+        server_default=func.now()
     )
-    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
 
 
 class RunModel(Base):
@@ -58,16 +94,16 @@ class RunModel(Base):
     ctx: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     progress: Mapped[float | None] = mapped_column(Float, nullable=True)
-    scheduled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
+    scheduled_at: Mapped[datetime | None] = _utc_datetime_column(
+        nullable=True, index=True
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+    created_at: Mapped[datetime] = _utc_datetime_column(
+        server_default=func.now()
     )
-    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    started_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    finished_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    locked_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
 
 
 class TaskModel(Base):
@@ -83,13 +119,11 @@ class TaskModel(Base):
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+    retry_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    created_at: Mapped[datetime] = _utc_datetime_column(
+        server_default=func.now()
     )
-    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    compensated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    updated_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    started_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    finished_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)
+    compensated_at: Mapped[datetime | None] = _utc_datetime_column(nullable=True)

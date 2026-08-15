@@ -12,7 +12,7 @@ features (e.g. worker wake-up via LISTEN/NOTIFY) have a clean home in
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -91,7 +91,7 @@ class SQLAlchemyBackend(Backend):
             retries=retries,
             idempotency_key=key,
             tags=tags,
-            updated_at=datetime.now(),
+            updated_at=datetime.now(timezone.utc),
         )
         try:
             with Session(self._engine) as session:
@@ -99,7 +99,7 @@ class SQLAlchemyBackend(Backend):
                 session.flush()
                 assert model.id is not None
                 session.add(
-                    RunModel(job_id=model.id, scheduled_at=scheduled_at, updated_at=datetime.now())
+                    RunModel(job_id=model.id, scheduled_at=scheduled_at, updated_at=datetime.now(timezone.utc))
                 )
                 session.commit()
                 return JobRecord.from_model(model)
@@ -151,7 +151,7 @@ class SQLAlchemyBackend(Backend):
             next_run_at=next_run_at,
             tags=tags,
             idempotency_key=idempotency_key,
-            updated_at=datetime.now(),
+            updated_at=datetime.now(timezone.utc),
         )
         with Session(self._engine) as session:
             session.add(model)
@@ -174,7 +174,7 @@ class SQLAlchemyBackend(Backend):
             conn.execute(
                 update(JobModel)
                 .where(JobModel.id == job_id)
-                .values(status=JobStatus.CANCELLED, updated_at=datetime.now())
+                .values(status=JobStatus.CANCELLED, updated_at=datetime.now(timezone.utc))
             )
             conn.execute(
                 update(RunModel)
@@ -184,9 +184,9 @@ class SQLAlchemyBackend(Backend):
                 )
                 .values(
                     status=RunStatus.CANCELLED,
-                    finished_at=datetime.now(),
+                    finished_at=datetime.now(timezone.utc),
                     locked_at=None,
-                    updated_at=datetime.now(),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -200,7 +200,7 @@ class SQLAlchemyBackend(Backend):
             row = conn.execute(
                 update(JobModel)
                 .where(JobModel.id == job_id)
-                .values(attempts=JobModel.attempts + 1, updated_at=datetime.now())
+                .values(attempts=JobModel.attempts + 1, updated_at=datetime.now(timezone.utc))
                 .returning(JobModel.attempts)
             ).first()
             return row[0] if row else 0
@@ -210,7 +210,7 @@ class SQLAlchemyBackend(Backend):
             conn.execute(
                 update(JobModel)
                 .where(JobModel.id == job_id)
-                .values(attempts=0, updated_at=datetime.now())
+                .values(attempts=0, updated_at=datetime.now(timezone.utc))
             )
 
     def delete_job(self, job_id: int) -> None:
@@ -285,7 +285,7 @@ class SQLAlchemyBackend(Backend):
             return [JobRecord.from_model(m) for m in models]
 
     def claim_scheduled(self, job_id: int, next_run_at: datetime | None) -> bool:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         run_in_flight = exists(
             select(RunModel.id).where(
                 RunModel.job_id == JobModel.id,
@@ -301,7 +301,7 @@ class SQLAlchemyBackend(Backend):
                     JobModel.next_run_at <= now,
                     ~run_in_flight,
                 )
-                .values(next_run_at=next_run_at, updated_at=datetime.now())
+                .values(next_run_at=next_run_at, updated_at=datetime.now(timezone.utc))
                 .returning(JobModel.id)
             ).first()
             return updated is not None
@@ -311,7 +311,7 @@ class SQLAlchemyBackend(Backend):
             conn.execute(
                 update(JobModel)
                 .where(JobModel.id == job_id)
-                .values(next_run_at=next_run_at, updated_at=datetime.now())
+                .values(next_run_at=next_run_at, updated_at=datetime.now(timezone.utc))
             )
 
     # -- runs (invocations) --------------------------------------------------
@@ -339,8 +339,8 @@ class SQLAlchemyBackend(Backend):
         Correct on every dialect; ``PostgresBackend`` overrides this with
         ``FOR UPDATE SKIP LOCKED`` for better behavior under contention.
         """
-        now = datetime.now()
-        lease_expiry = datetime.now() - timedelta(seconds=lease_seconds)
+        now = datetime.now(timezone.utc)
+        lease_expiry = datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
         ready = and_(
             RunModel.status == RunStatus.READY,
             (RunModel.scheduled_at.is_(None)) | (RunModel.scheduled_at <= now),
@@ -395,7 +395,7 @@ class SQLAlchemyBackend(Backend):
                     RunModel.worker_id == worker_id,
                     RunModel.status == RunStatus.RUNNING,
                 )
-                .values(locked_at=datetime.now(), updated_at=datetime.now())
+                .values(locked_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc))
                 .returning(RunModel.id)
             ).first()
             return updated is not None
@@ -408,9 +408,9 @@ class SQLAlchemyBackend(Backend):
                 .values(
                     status=RunStatus.SUCCEEDED,
                     result=result,
-                    finished_at=datetime.now(),
+                    finished_at=datetime.now(timezone.utc),
                     locked_at=None,
-                    updated_at=datetime.now(),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -434,7 +434,7 @@ class SQLAlchemyBackend(Backend):
                         finished_at=None,
                         locked_at=None,
                         worker_id=None,
-                        updated_at=datetime.now(),
+                        updated_at=datetime.now(timezone.utc),
                     )
                 )
             else:
@@ -444,9 +444,9 @@ class SQLAlchemyBackend(Backend):
                     .values(
                         status=RunStatus.FAILED,
                         error=error,
-                        finished_at=datetime.now(),
+                        finished_at=datetime.now(timezone.utc),
                         locked_at=None,
-                        updated_at=datetime.now(),
+                        updated_at=datetime.now(timezone.utc),
                     )
                 )
 
@@ -457,9 +457,9 @@ class SQLAlchemyBackend(Backend):
                 .where(RunModel.id == run_id)
                 .values(
                     status=RunStatus.CANCELLED,
-                    finished_at=datetime.now(),
+                    finished_at=datetime.now(timezone.utc),
                     locked_at=None,
-                    updated_at=datetime.now(),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -468,7 +468,7 @@ class SQLAlchemyBackend(Backend):
             conn.execute(
                 update(RunModel)
                 .where(RunModel.id == run_id)
-                .values(ctx=ctx, updated_at=datetime.now())
+                .values(ctx=ctx, updated_at=datetime.now(timezone.utc))
             )
 
     def set_run_progress(self, run_id: int, progress: float | None) -> None:
@@ -476,7 +476,7 @@ class SQLAlchemyBackend(Backend):
             conn.execute(
                 update(RunModel)
                 .where(RunModel.id == run_id)
-                .values(progress=progress, updated_at=datetime.now())
+                .values(progress=progress, updated_at=datetime.now(timezone.utc))
             )
 
     def get_run(self, run_id: int) -> RunRecord | None:
@@ -548,7 +548,7 @@ class SQLAlchemyBackend(Backend):
         *,
         scheduled_at: datetime | None = None,
     ) -> RunRecord:
-        model = RunModel(job_id=job_id, scheduled_at=scheduled_at, updated_at=datetime.now())
+        model = RunModel(job_id=job_id, scheduled_at=scheduled_at, updated_at=datetime.now(timezone.utc))
         with Session(self._engine) as session:
             session.add(model)
             session.commit()
@@ -593,9 +593,9 @@ class SQLAlchemyBackend(Backend):
                         task_name=task_name,
                         status=TaskStatus.RUNNING,
                         attempts=attempts,
-                        created_at=datetime.now(),
-                        updated_at=datetime.now(),
-                        started_at=datetime.now(),
+                        created_at=datetime.now(timezone.utc),
+                        updated_at=datetime.now(timezone.utc),
+                        started_at=datetime.now(timezone.utc),
                     )
                 )
             else:
@@ -612,8 +612,8 @@ class SQLAlchemyBackend(Backend):
                         error=None,
                         attempts=attempts,
                         retry_at=None,
-                        updated_at=datetime.now(),
-                        started_at=datetime.now(),
+                        updated_at=datetime.now(timezone.utc),
+                        started_at=datetime.now(timezone.utc),
                         finished_at=None,
                     )
                 )
@@ -627,8 +627,8 @@ class SQLAlchemyBackend(Backend):
                     status=TaskStatus.SUCCEEDED,
                     result=result,
                     error=None,
-                    finished_at=datetime.now(),
-                    updated_at=datetime.now(),
+                    finished_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -650,8 +650,8 @@ class SQLAlchemyBackend(Backend):
                     error=error,
                     attempts=attempts,
                     retry_at=retry_at,
-                    finished_at=datetime.now(),
-                    updated_at=datetime.now(),
+                    finished_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -662,8 +662,8 @@ class SQLAlchemyBackend(Backend):
                 .where(TaskModel.run_id == run_id, TaskModel.position == position)
                 .values(
                     status=TaskStatus.CANCELLED,
-                    finished_at=datetime.now(),
-                    updated_at=datetime.now(),
+                    finished_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -674,7 +674,7 @@ class SQLAlchemyBackend(Backend):
                 .where(TaskModel.run_id == run_id, TaskModel.position == position)
                 .values(
                     status=TaskStatus.COMPENSATED,
-                    compensated_at=datetime.now(),
-                    updated_at=datetime.now(),
+                    compensated_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
