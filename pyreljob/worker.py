@@ -181,6 +181,7 @@ class Worker:
         except Exception:
             logger.exception("run %s: unhandled error", run.id)
             await asyncio.to_thread(self._backend.fail_run, run.id, "unhandled error")
+            await self._reschedule_on_error(run)
 
     async def _run(self, run: RunRecord) -> None:
         assert run.id is not None
@@ -199,6 +200,7 @@ class Worker:
             await asyncio.to_thread(
                 self._backend.fail_run, run.id, f"No class registered for {job.job!r}"
             )
+            await self._reschedule_on_error(run)
             return
 
         ctx = self._build_ctx(run, job)
@@ -288,6 +290,23 @@ class Worker:
         instance = job_cls.from_dict(job.args or {})
         next_runtime = instance.next_runtime(run, ctx)
         await asyncio.to_thread(self._backend.set_next_run_at, job.id, next_runtime)
+
+    async def _reschedule_on_error(self, run: RunRecord) -> None:
+        """Re-arm a maintained job after an unrecoverable error.
+
+        When the job class can't be resolved or an unhandled exception occurs,
+        the normal ``_reschedule`` path is unreachable.  This fallback sets
+        ``next_run_at = now`` so the scheduler retries on the next tick
+        instead of the job dying permanently with ``next_run_at = NULL``.
+        """
+        job = await asyncio.to_thread(self._backend.get, run.job_id)
+        if job is None or job.source != JobSource.SCHEDULED or job.id is None:
+            return
+        await asyncio.to_thread(self._backend.set_next_run_at, job.id, datetime.now(timezone.utc))
+        logger.warning(
+            "run %s: rescheduled job %s after error (next_run_at=now)",
+            run.id, job.job,
+        )
 
     async def _run_task(
         self,
