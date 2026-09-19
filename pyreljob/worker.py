@@ -200,7 +200,6 @@ class Worker:
             await asyncio.to_thread(
                 self._backend.fail_run, run.id, f"No class registered for {job.job!r}"
             )
-            await self._reschedule_on_error(run)
             return
 
         ctx = self._build_ctx(run, job)
