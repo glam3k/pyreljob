@@ -16,6 +16,7 @@ from typing import ClassVar
 
 import pytest
 from sqlalchemy import create_engine, text, update
+from sqlalchemy.exc import OperationalError
 
 from pyreljob import (
     Job,
@@ -1083,3 +1084,74 @@ def test_migration_upgrades_legacy_v1_schema(tmp_path):
             c["name"] for c in __import__("sqlalchemy").inspect(conn).get_columns("runs")
         }
         assert "progress" in run_columns
+
+
+class FlakyBackend:
+    """Wraps a backend and raises from ``claim`` for the first `failures` calls.
+
+    Stands in for a transient database problem: the connection drops, a deadlock
+    times out, the pool is momentarily exhausted. Nothing about it says the
+    worker is broken.
+    """
+
+    def __init__(self, backend, failures: int) -> None:
+        self._backend = backend
+        self._failures = failures
+        self.claims = 0
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+    def claim(self, *args, **kwargs):
+        self.claims += 1
+        if self._failures > 0:
+            self._failures -= 1
+            raise OperationalError("simulated connection failure")
+        return self._backend.claim(*args, **kwargs)
+
+
+def test_worker_survives_a_failing_claim(manager):
+    """A transient claim failure must not end the worker.
+
+    Claiming talks to the database, so it fails for reasons that have nothing to
+    do with the worker's health — a dropped connection, a deadlock, a timeout.
+    Before this was guarded, such an error unwound out of ``run_forever``: the
+    thread exited and every background job in the process stopped, silently,
+    while the API kept serving traffic. The scheduler's own loop has always
+    tolerated this; the worker must too.
+    """
+    backend = FlakyBackend(manager.backend, failures=3)
+    manager.enqueue(Sum(1, 1))
+    worker = Worker(backend, poll_interval=0.02)
+    worker.register(job_cls_path(Sum), Sum)
+
+    thread = threading.Thread(target=worker.run_forever, daemon=True)
+    thread.start()
+    try:
+        deadline = time.time() + 20
+        while manager.counts().get("succeeded", 0) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        assert manager.counts().get("succeeded") == 1, "worker gave up after failing claims"
+        assert backend.claims > 3, "the failures should have been retried"
+        assert thread.is_alive()
+    finally:
+        worker.stop()
+        thread.join(timeout=5)
+
+
+def test_worker_gives_up_quickly_on_a_persistent_failure(manager):
+    """A permanently broken backend must not become a hot loop."""
+    backend = FlakyBackend(manager.backend, failures=10**6)
+    worker = Worker(backend, poll_interval=0.05)
+    worker.register(job_cls_path(Sum), Sum)
+
+    thread = threading.Thread(target=worker.run_forever, daemon=True)
+    thread.start()
+    time.sleep(0.6)
+    try:
+        assert thread.is_alive(), "worker should keep retrying, not exit"
+        # ~12 attempts in 0.6s at a 0.05s backoff; a hot loop would be thousands.
+        assert backend.claims < 50, f"hot loop: {backend.claims} claims"
+    finally:
+        worker.stop()
+        thread.join(timeout=5)

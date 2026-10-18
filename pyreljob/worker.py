@@ -120,31 +120,59 @@ class Worker:
         pending: set[asyncio.Task[Any]] = set()
         try:
             while self._running:
-                # Claim runs up to the concurrency cap.
-                while self._running and len(pending) < self._max_concurrency:
-                    run = await asyncio.to_thread(
-                        self._backend.claim,
-                        self._worker_id,
-                        self._queue,
-                        lease_seconds=self._lease_seconds,
+                # One bad iteration must not end the worker. Claiming talks to the
+                # database, and a transient failure there (a dropped connection, a
+                # deadlock, a timeout) says nothing about whether the worker
+                # itself is healthy. Swallowing it keeps polling, which is what
+                # the beat's own loop does; an unhandled exception here would
+                # unwind out of run_forever and leave the thread dead for the life
+                # of the process, taking every background job with it and logging
+                # nothing but a traceback nobody reads.
+                try:
+                    await self._poll_once(pending)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "worker %s: poll failed, retrying", self._worker_id
                     )
-                    if run is None:
-                        break
-                    pending.add(asyncio.create_task(self._execute(run)))
-                if not pending:
+                    # Back off so a persistent failure cannot become a hot loop.
                     await asyncio.sleep(self._poll_interval)
-                else:
-                    await asyncio.wait(
-                        pending, timeout=self._poll_interval,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    pending = {t for t in pending if not t.done()}
         finally:
             self._running = False
             heartbeat.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)  # drain
         logger.info("worker %s stopped", self._worker_id)
+
+    async def _poll_once(self, pending: set[asyncio.Task[Any]]) -> None:
+        """One claim-and-dispatch pass: fill up to the concurrency cap, then wait.
+
+        Split out of the main loop so the loop can guard it; an error here is a
+        failed poll, not a dead worker.
+        """
+        # Claim runs up to the concurrency cap.
+        while self._running and len(pending) < self._max_concurrency:
+            run = await asyncio.to_thread(
+                self._backend.claim,
+                self._worker_id,
+                self._queue,
+                lease_seconds=self._lease_seconds,
+            )
+            if run is None:
+                break
+            pending.add(asyncio.create_task(self._execute(run)))
+        if not pending:
+            await asyncio.sleep(self._poll_interval)
+        else:
+            await asyncio.wait(
+                pending, timeout=self._poll_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Mutate in place: the caller owns this set and caps concurrency on
+            # its size, so a local rebind here would leave finished tasks behind
+            # and wedge the cap shut.
+            pending.difference_update({t for t in pending if t.done()})
 
     async def _heartbeat_loop(self) -> None:
         interval = max(1.0, self._lease_seconds / 3)
