@@ -32,7 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from pyreljob.backends.base import Backend
+from pyreljob.backends.base import Backend, Reconciled
 from pyreljob.job import (
     JobRecord,
     JobSource,
@@ -46,6 +46,12 @@ from pyreljob.job import (
 from pyreljob.migrations.runner import MigrationRunner
 from pyreljob.migrations.versions import MIGRATIONS
 from pyreljob.models.orm import JobModel, RunModel, TaskModel
+
+# How many stale runs one reconcile pass handles, so the sweep stays cheap on a
+# database that queued up thousands while no worker was running.
+_RECONCILE_BATCH = 500
+
+_ABANDONED_ERROR = "abandoned: no worker executed this run"
 
 
 class SQLAlchemyBackend(Backend):
@@ -99,7 +105,11 @@ class SQLAlchemyBackend(Backend):
                 session.flush()
                 assert model.id is not None
                 session.add(
-                    RunModel(job_id=model.id, scheduled_at=scheduled_at, updated_at=datetime.now(timezone.utc))
+                    RunModel(
+                        job_id=model.id,
+                        scheduled_at=scheduled_at,
+                        updated_at=datetime.now(timezone.utc),
+                    )
                 )
                 session.commit()
                 return JobRecord.from_model(model)
@@ -164,6 +174,7 @@ class SQLAlchemyBackend(Backend):
         if key is None:
             return model.idempotency_key.is_(None)
         return model.idempotency_key == key
+
     def get(self, job_id: int) -> JobRecord | None:
         with Session(self._engine) as session:
             model = session.get(JobModel, job_id)
@@ -305,6 +316,65 @@ class SQLAlchemyBackend(Backend):
                 .returning(JobModel.id)
             ).first()
             return updated is not None
+
+    def reconcile_abandoned(self, grace_seconds: int = 300) -> Reconciled:
+        """Re-arm jobs whose fire was claimed but never executed.
+
+        See :meth:`Backend.reconcile_abandoned` for why this is needed. Only
+        ``ready`` runs are swept: a ``running`` run whose worker died is already
+        reclaimed by :meth:`claim` once its lease expires.
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=grace_seconds)
+        total = Reconciled()
+        while True:
+            with self._engine.begin() as conn:
+                stale = conn.execute(
+                    select(RunModel.id, RunModel.job_id)
+                    .where(
+                        RunModel.status == RunStatus.READY,
+                        RunModel.created_at < cutoff,
+                        # A run scheduled for the future is waiting, not abandoned.
+                        or_(
+                            RunModel.scheduled_at.is_(None),
+                            RunModel.scheduled_at <= cutoff,
+                        ),
+                    )
+                    .order_by(RunModel.id.asc())
+                    .limit(_RECONCILE_BATCH)
+                ).all()
+                if not stale:
+                    break
+                runs = conn.execute(
+                    update(RunModel)
+                    .where(
+                        RunModel.id.in_([r.id for r in stale]),
+                        RunModel.status == RunStatus.READY,
+                    )
+                    .values(
+                        status=RunStatus.FAILED,
+                        error=_ABANDONED_ERROR,
+                        finished_at=now,
+                        updated_at=now,
+                    )
+                ).rowcount
+                jobs = conn.execute(
+                    update(JobModel)
+                    .where(
+                        JobModel.id.in_({r.job_id for r in stale}),
+                        JobModel.source == JobSource.SCHEDULED,
+                        JobModel.status == JobStatus.ACTIVE,
+                        # Only revive a disarmed job. One that was re-armed since
+                        # the run went stale still has a schedule of its own.
+                        JobModel.next_run_at.is_(None),
+                    )
+                    .values(next_run_at=now, updated_at=now)
+                ).rowcount
+            total = Reconciled(runs=total.runs + (runs or 0), jobs=total.jobs + (jobs or 0))
+            if len(stale) < _RECONCILE_BATCH or not (runs or jobs):
+                # A full batch, or a race that left every candidate alone.
+                break
+        return total
 
     def set_next_run_at(self, job_id: int, next_run_at: datetime | None) -> None:
         with self._engine.begin() as conn:

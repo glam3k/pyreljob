@@ -134,3 +134,52 @@ def test_worker_reclaims_expired_lease(manager):
     assert reclaimed is not None and reclaimed.id == run.id
     _release.set()
     t.join(timeout=5)
+
+
+@dataclass
+class Poller(Job):
+    tasks: ClassVar = [Add]
+    a: int = 0
+    b: int = 0
+
+    def next_runtime(self, last_run, ctx: TaskContext) -> datetime | None:
+        return datetime.now(timezone.utc) + timedelta(seconds=5)
+
+
+def test_reconcile_abandoned_runs(manager):
+    """A claimed-but-unexecuted fire must not end a job's schedule.
+
+    Postgres is the dialect that matters: it uses ``FOR UPDATE SKIP LOCKED`` for
+    claiming, so the recovery sweep has to coexist with concurrent claimers.
+    """
+    from sqlalchemy import update
+
+    from pyreljob.models.orm import JobModel, RunModel
+
+    job = manager.schedule(Poller(), idempotency_key="reconcile:1")
+    with manager.backend._engine.begin() as conn:
+        conn.execute(
+            update(JobModel)
+            .where(JobModel.id == job.id)
+            .values(next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        )
+    manager.tick()
+    assert manager.get(job.id).next_run_at is None  # claimed, no worker to run it
+
+    run = manager.runs(job.id)[0]
+    with manager.backend._engine.begin() as conn:
+        conn.execute(
+            update(RunModel)
+            .where(RunModel.id == run.id)
+            .values(created_at=datetime.now(timezone.utc) - timedelta(hours=1))
+        )
+
+    result = manager.reconcile()
+
+    assert (result.runs, result.jobs) == (1, 1)
+    assert manager.runs(job.id)[0].status == RunStatus.FAILED
+    assert manager.get(job.id).next_run_at is not None
+
+    # And it fires again.
+    manager.tick()
+    assert len(manager.runs(job.id)) == 2

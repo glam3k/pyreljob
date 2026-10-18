@@ -1,10 +1,23 @@
 """Backend interface. Implementations abstract the database."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from pyreljob.job import JobRecord, RunRecord, RunWithJob, TaskRecord
+
+
+@dataclass(frozen=True)
+class Reconciled:
+    """What :meth:`Backend.reconcile_abandoned` recovered.
+
+    ``runs`` are invocations marked failed because they were never executed;
+    ``jobs`` are maintained jobs re-armed so the beat will fire them again.
+    """
+
+    runs: int = 0
+    jobs: int = 0
 
 
 class Backend(ABC):
@@ -111,6 +124,30 @@ class Backend(ABC):
     @abstractmethod
     def set_next_run_at(self, job_id: int, next_run_at: datetime | None) -> None:
         """Re-arm a job's next fire time (called by the worker after a run)."""
+
+    @abstractmethod
+    def reconcile_abandoned(self, grace_seconds: int = 300) -> Reconciled:
+        """Recover maintained jobs whose fire was claimed but never executed.
+
+        The beat claims a due job by setting ``next_run_at = NULL`` and creating a
+        run; the worker re-arms the job after that run completes. Nothing else
+        can revive the job, because ``claim_scheduled`` requires
+        ``next_run_at <= now`` (a NULL never compares true) and refuses to re-fire
+        while a run is still in flight. So if the created run is never executed —
+        every worker is down, the process dies between the claim and the run being
+        claimed, the run is purged — the job is dead for the life of the process
+        and its schedule silently stops.
+
+        This finds ``ready`` runs older than ``grace_seconds`` that were not
+        waiting on a future ``scheduled_at``, marks them failed, and re-arms the
+        jobs they belonged to. Runs are failed rather than retried: the job firing
+        again is the retry, and that keeps one mechanism for "try again".
+
+        Both updates are conditional, so this is safe to run concurrently and
+        idempotent: a run the worker claimed in the meantime is no longer
+        ``ready`` and is skipped, and a job re-armed in the meantime is no longer
+        disarmed.
+        """
 
     # -- runs (invocations) --------------------------------------------------
 

@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from pyreljob.backends import backend_from_url
-from pyreljob.backends.base import Backend
+from pyreljob.backends.base import Backend, Reconciled
 from pyreljob.job import JobRecord, RunRecord, RunWithJob, TaskRecord, TaskStatus
 from pyreljob.task import (
     Job,
@@ -51,10 +51,19 @@ class JobManager:
         manager.runs(job.id)   # the job's invocations
     """
 
-    def __init__(self, database_url: str, backend: Backend | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        backend: Backend | None = None,
+        *,
+        abandoned_grace_seconds: int = 300,
+    ) -> None:
         self._backend = backend or backend_from_url(database_url)
         self._running = False
         self._misfire_grace_seconds: int | None = None
+        # How long a run may sit unexecuted before the beat assumes no worker is
+        # coming and re-arms its job instead.
+        self._abandoned_grace_seconds = abandoned_grace_seconds
 
     @property
     def backend(self) -> Backend:
@@ -172,8 +181,10 @@ class JobManager:
         cls = resolve_job(record.job)
         if cls is None:
             raise ValueError(f"cannot resolve job class {record.job!r}")
-        ctx = TaskContext.from_dict(run.ctx) if run.ctx else TaskContext(
-            job_id=run.job_id, job=record.job, args=record.args or {}
+        ctx = (
+            TaskContext.from_dict(run.ctx)
+            if run.ctx
+            else TaskContext(job_id=run.job_id, job=record.job, args=record.args or {})
         )
         ctx.job_id = run.job_id
         for task_record in reversed(self._backend.tasks(run.id)):
@@ -234,6 +245,7 @@ class JobManager:
         import threading
 
         if threading.current_thread() is threading.main_thread():
+
             def handle_signal() -> None:
                 self.stop()
 
@@ -257,6 +269,27 @@ class JobManager:
         finally:
             self._running = False
 
+    def reconcile(self) -> Reconciled:
+        """Re-arm maintained jobs whose fire was claimed but never executed.
+
+        A claimed job is disarmed (``next_run_at = NULL``) and its run is the only
+        thing that can re-arm it. If no worker ever executes that run, the job
+        stops firing forever and nothing reports it — the scheduler skips a NULL
+        ``next_run_at``, so it will not even try again.
+
+        The beat calls this before every tick. ``grace_seconds`` must exceed the
+        longest a run may legitimately wait for a worker, or a busy queue will
+        have healthy runs declared abandoned.
+        """
+        result = self._backend.reconcile_abandoned(self._abandoned_grace_seconds)
+        if result.runs or result.jobs:
+            logger.warning(
+                "reconciled %d abandoned run(s), re-armed %d scheduled job(s)",
+                result.runs,
+                result.jobs,
+            )
+        return result
+
     def stop(self) -> None:
         self._running = False
 
@@ -273,6 +306,9 @@ class JobManager:
             if misfire_grace_seconds is not None
             else self._misfire_grace_seconds
         )
+        # Recover jobs whose previous fire never ran, so one bad window does not
+        # silently end their schedule.
+        self.reconcile()
         for job in self._backend.list_scheduled():
             if job.id is None:
                 continue
@@ -294,9 +330,7 @@ class JobManager:
             self._backend.create_run(job.id)
 
     @staticmethod
-    def _is_misfired(
-        next_run_at: datetime | None, now: datetime, grace: int | None
-    ) -> bool:
+    def _is_misfired(next_run_at: datetime | None, now: datetime, grace: int | None) -> bool:
         if grace is None or next_run_at is None:
             return False
         return (now - next_run_at) > timedelta(seconds=grace)
