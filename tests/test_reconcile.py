@@ -224,3 +224,57 @@ def test_a_worker_picking_up_a_run_races_safely(manager):
     result = manager.reconcile()
     assert (result.runs, result.jobs) == (0, 0)
     assert manager.runs(job.id)[0].status == RunStatus.RUNNING
+
+
+def test_a_disarmed_job_with_no_in_flight_run_is_rearmed(manager):
+    """The other way a job gets lost: its run finished and nothing re-armed it.
+
+    The worker deliberately skips ``_reschedule`` for a run whose job class cannot
+    be resolved, so a module that moved or was renamed leaves the job disarmed
+    with every run terminal. Nothing is left for the stale-run sweep to notice, and
+    the job is silently gone from the schedule.
+    """
+    job = manager.schedule(Poller())
+    fire_once(manager, job)
+    run = manager.runs(job.id)[0]
+    # The run completed, but the job was never re-armed.
+    with manager.backend._engine.begin() as conn:
+        conn.execute(
+            update(RunModel)
+            .where(RunModel.id == run.id)
+            .values(
+                status=RunStatus.FAILED,
+                created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+        )
+        conn.execute(
+            update(JobModel)
+            .where(JobModel.id == job.id)
+            .values(updated_at=datetime.now(timezone.utc) - timedelta(hours=1))
+        )
+
+    result = manager.reconcile()
+
+    assert (result.runs, result.jobs) == (0, 1)
+    assert manager.get(job.id).next_run_at is not None
+
+
+def test_a_claim_in_flight_is_not_double_fired(manager):
+    """Claiming and creating the run are two statements, not one transaction.
+
+    Between them the job is disarmed with no run at all. Treating that as an
+    orphan would let two beats race and fire the job twice, so the grace window
+    is what makes the sweep safe.
+    """
+    job = manager.schedule(Poller())
+    with manager.backend._engine.begin() as conn:
+        conn.execute(
+            update(JobModel)
+            .where(JobModel.id == job.id)
+            .values(next_run_at=None, updated_at=datetime.now(timezone.utc))
+        )
+
+    result = manager.reconcile()
+
+    assert (result.runs, result.jobs) == (0, 0)
+    assert manager.get(job.id).next_run_at is None

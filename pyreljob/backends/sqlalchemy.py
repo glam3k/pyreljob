@@ -374,7 +374,44 @@ class SQLAlchemyBackend(Backend):
             if len(stale) < _RECONCILE_BATCH or not (runs or jobs):
                 # A full batch, or a race that left every candidate alone.
                 break
-        return total
+        return Reconciled(
+            runs=total.runs, jobs=total.jobs + self._rearm_orphaned_jobs(now, cutoff)
+        )
+
+    def _rearm_orphaned_jobs(self, now: datetime, cutoff: datetime) -> int:
+        """Re-arm maintained jobs left disarmed with nothing left to re-arm them.
+
+        The sweep above covers a lost run, but a job can also end up disarmed with
+        every one of its runs already terminal: the worker resolved the run and
+        deliberately skipped ``_reschedule`` (b4abcf5 does this for class-not-found,
+        so a moved or renamed module fails loudly instead of retrying forever), or
+        the process died between finishing the run and re-arming. There is nothing
+        left to notice that, so the job is silently gone from the schedule.
+
+        The ``updated_at < cutoff`` condition is what makes this safe: claiming a
+        job stamps ``updated_at``, so a claim whose run has not been created yet
+        (they are two statements, not one transaction) is inside the grace window
+        and is left alone rather than double-fired.
+        """
+        run_in_flight = exists(
+            select(RunModel.id).where(
+                RunModel.job_id == JobModel.id,
+                RunModel.status.in_([RunStatus.READY, RunStatus.RUNNING]),
+            )
+        )
+        with self._engine.begin() as conn:
+            rearmed = conn.execute(
+                update(JobModel)
+                .where(
+                    JobModel.source == JobSource.SCHEDULED,
+                    JobModel.status == JobStatus.ACTIVE,
+                    JobModel.next_run_at.is_(None),
+                    JobModel.updated_at < cutoff,
+                    ~run_in_flight,
+                )
+                .values(next_run_at=now, updated_at=now)
+            ).rowcount
+        return rearmed or 0
 
     def set_next_run_at(self, job_id: int, next_run_at: datetime | None) -> None:
         with self._engine.begin() as conn:
