@@ -57,6 +57,10 @@ _ABANDONED_ERROR = "abandoned: no worker executed this run"
 class SQLAlchemyBackend(Backend):
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+        #: When a worker last claimed a run. The abandoned-run sweep consults this
+        #: instead of trusting wall-clock age alone: a run created before the last
+        #: claim is queued behind real work, not lost.
+        self.last_claim_at: datetime | None = None
 
     @property
     def engine(self) -> Engine:
@@ -327,21 +331,28 @@ class SQLAlchemyBackend(Backend):
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(seconds=grace_seconds)
         total = Reconciled()
+        # Age alone is the wrong signal. A worker with max_concurrency=1 that is
+        # halfway through a slow job (a feed fetch, an IMAP sync) leaves the rest
+        # of the queue waiting, and a wall-clock sweep called that "abandoned"
+        # and failed runs that were about to execute normally. If a worker has
+        # claimed anything since a run was created, that run is queued behind real
+        # work rather than lost, so it is left alone.
+        progress_cutoff = self.last_claim_at
         while True:
             with self._engine.begin() as conn:
+                stale_query = select(RunModel.id, RunModel.job_id).where(
+                    RunModel.status == RunStatus.READY,
+                    RunModel.created_at < cutoff,
+                    # A run scheduled for the future is waiting, not abandoned.
+                    or_(
+                        RunModel.scheduled_at.is_(None),
+                        RunModel.scheduled_at <= cutoff,
+                    ),
+                )
+                if progress_cutoff is not None:
+                    stale_query = stale_query.where(RunModel.created_at < progress_cutoff)
                 stale = conn.execute(
-                    select(RunModel.id, RunModel.job_id)
-                    .where(
-                        RunModel.status == RunStatus.READY,
-                        RunModel.created_at < cutoff,
-                        # A run scheduled for the future is waiting, not abandoned.
-                        or_(
-                            RunModel.scheduled_at.is_(None),
-                            RunModel.scheduled_at <= cutoff,
-                        ),
-                    )
-                    .order_by(RunModel.id.asc())
-                    .limit(_RECONCILE_BATCH)
+                    stale_query.order_by(RunModel.id.asc()).limit(_RECONCILE_BATCH)
                 ).all()
                 if not stale:
                     break
@@ -491,6 +502,9 @@ class SQLAlchemyBackend(Backend):
             model = session.get(RunModel, run_id)
             if model is None:
                 return None
+            # Progress marker for the abandoned-run sweep: work is being done, so
+            # anything still waiting is queued rather than lost.
+            self.last_claim_at = now
             return RunRecord.from_model(model)
 
     def renew_lease(self, run_id: int, worker_id: str) -> bool:

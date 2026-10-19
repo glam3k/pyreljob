@@ -278,3 +278,43 @@ def test_a_claim_in_flight_is_not_double_fired(manager):
 
     assert (result.runs, result.jobs) == (0, 0)
     assert manager.get(job.id).next_run_at is None
+
+
+def test_a_queued_run_is_not_mistaken_for_an_abandoned_one(manager):
+    """Age alone is the wrong signal, and it failed in production.
+
+    A worker with max_concurrency=1 partway through a slow job — a feed fetch,
+    an IMAP sync — leaves the rest of the queue waiting. A wall-clock sweep
+    declared those waiting runs "abandoned: no worker executed this run" and
+    failed them five minutes after they were created, while the worker was
+    demonstrably still working through the queue.
+
+    So the sweep now asks whether a worker has claimed anything *since* the run
+    was created. If it has, the run is queued behind real work.
+    """
+    backend = manager.backend
+    job = manager.schedule(Poller())
+    manager.tick()  # creates a ready run nobody has executed
+
+    # A worker claims something else: the queue is moving.
+    backend.last_claim_at = datetime.now(timezone.utc)
+
+    result = manager.reconcile()
+
+    assert (result.runs, result.jobs) == (0, 0)
+    assert manager.runs(job.id)[0].status == RunStatus.READY, (
+        "a run queued behind a busy worker must not be failed"
+    )
+
+
+def test_a_run_still_gets_recovered_when_no_worker_ever_claims_it(manager):
+    """The fix must not disable recovery — that was the whole point of the sweep."""
+    job = manager.schedule(Poller())
+    manager.tick()
+    run = manager.runs(job.id)[0]
+    age_run(manager, run.id)
+
+    result = manager.reconcile()
+
+    assert (result.runs, result.jobs) == (1, 1)
+    assert manager.runs(job.id)[0].status == RunStatus.FAILED

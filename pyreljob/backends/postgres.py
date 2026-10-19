@@ -69,5 +69,8 @@ class PostgresBackend(SQLAlchemyBackend):
             model = session.get(RunModel, run_id)
             if model is None:
                 return None
+            # Progress marker for the abandoned-run sweep — see the SQLAlchemy
+            # backend; this one overrides claim() and needs its own.
+            self.last_claim_at = now
             return RunRecord.from_model(model)
 
